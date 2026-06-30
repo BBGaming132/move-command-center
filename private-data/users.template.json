@@ -1,0 +1,19 @@
+{
+  "users": [
+    {
+      "username": "REPLACE-WITH-PRIMARY-USERNAME",
+      "displayName": "Primary device user",
+      "password": "REPLACE-WITH-A-UNIQUE-14+-CHARACTER-PASSWORD"
+    },
+    {
+      "username": "REPLACE-WITH-SECOND-USERNAME",
+      "displayName": "Second family user",
+      "password": "REPLACE-WITH-A-DIFFERENT-14+-CHARACTER-PASSWORD"
+    },
+    {
+      "username": "REPLACE-WITH-THIRD-USERNAME",
+      "displayName": "Third family user",
+      "password": "REPLACE-WITH-A-THIRD-UNIQUE-14+-CHARACTER-PASSWORD"
+    }
+  ]
+}

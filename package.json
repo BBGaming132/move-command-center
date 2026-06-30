@@ -1,0 +1,27 @@
+{
+  "name": "move-command-center",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "validate:private": "node scripts/validate-inventory.mjs && npm run validate:security",
+    "bootstrap:firebase": "npm run validate:private && node scripts/bootstrap-firebase.mjs",
+    "build": "npm run validate:security && tsc --noEmit && vite build && node scripts/verify-public-dist.mjs",
+    "preview": "vite preview --host 0.0.0.0",
+    "package": "npm run validate:private && npm run build && node scripts/package-release.mjs",
+    "validate:security": "node scripts/validate-security-config.mjs"
+  },
+  "dependencies": {
+    "firebase": "12.15.0"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "vite": "8.1.0",
+    "vite-plugin-pwa": "1.3.0",
+    "firebase-admin": "13.5.0"
+  }
+}

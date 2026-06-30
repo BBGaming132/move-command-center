@@ -1,0 +1,95 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isMoveMember() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/moves/n4CxhHlF8sszxyy9zdYt_I1B/members/$(request.auth.uid))
+        && get(/databases/$(database)/documents/moves/n4CxhHlF8sszxyy9zdYt_I1B/members/$(request.auth.uid)).data.active == true;
+    }
+
+    function memberUsername() {
+      return get(/databases/$(database)/documents/moves/n4CxhHlF8sszxyy9zdYt_I1B/members/$(request.auth.uid)).data.username;
+    }
+
+    function validReceivedPayload() {
+      return request.resource.data.payload.keys().hasOnly([]);
+    }
+
+    function validReceiptVoidPayload() {
+      return request.resource.data.payload.keys().hasOnly(['receiptId'])
+        && request.resource.data.payload.receiptId is string
+        && request.resource.data.payload.receiptId.size() > 0
+        && request.resource.data.payload.receiptId.size() <= 100;
+    }
+
+    function validIssuePayload() {
+      return request.resource.data.payload.keys().hasOnly(['note'])
+        && request.resource.data.payload.note is string
+        && request.resource.data.payload.note.size() > 0
+        && request.resource.data.payload.note.size() <= 1000;
+    }
+
+    function validPlanPayload() {
+      return request.resource.data.payload.keys().hasOnly([
+        'assignedCrateId', 'destinationCode', 'destinationLabel', 'notes'
+      ])
+        && request.resource.data.payload.assignedCrateId is string
+        && request.resource.data.payload.assignedCrateId.size() <= 40
+        && request.resource.data.payload.destinationCode is string
+        && request.resource.data.payload.destinationCode.size() <= 40
+        && request.resource.data.payload.destinationLabel is string
+        && request.resource.data.payload.destinationLabel.size() <= 120
+        && request.resource.data.payload.notes is string
+        && request.resource.data.payload.notes.size() <= 2000;
+    }
+
+    function validEvent(eventId) {
+      return request.resource.data.keys().hasOnly([
+        'id', 'moveId', 'type', 'itemId', 'deviceId', 'deviceName',
+        'actorUid', 'actorUsername', 'clientAt', 'payload'
+      ])
+        && request.resource.data.id == eventId
+        && request.resource.data.moveId == 'n4CxhHlF8sszxyy9zdYt_I1B'
+        && request.resource.data.type in ['RECEIVED', 'PLAN_UPDATE', 'ISSUE', 'RECEIPT_VOID']
+        && request.resource.data.itemId is string
+        && request.resource.data.itemId.matches('^[1-9][0-9]{0,2}$')
+        && request.resource.data.deviceId is string
+        && request.resource.data.deviceId.size() > 0
+        && request.resource.data.deviceId.size() <= 100
+        && request.resource.data.deviceName is string
+        && request.resource.data.deviceName.size() > 0
+        && request.resource.data.deviceName.size() <= 80
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.actorUsername == memberUsername()
+        && request.resource.data.clientAt is int
+        && request.resource.data.payload is map
+        && (
+          (request.resource.data.type == 'RECEIVED' && validReceivedPayload())
+          || (request.resource.data.type == 'RECEIPT_VOID' && validReceiptVoidPayload())
+          || (request.resource.data.type == 'ISSUE' && validIssuePayload())
+          || (request.resource.data.type == 'PLAN_UPDATE' && validPlanPayload())
+        );
+    }
+
+    match /moves/n4CxhHlF8sszxyy9zdYt_I1B/members/{uid} {
+      allow read: if isMoveMember() && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    match /moves/n4CxhHlF8sszxyy9zdYt_I1B/private/inventory {
+      allow read: if isMoveMember();
+      allow write: if false;
+    }
+
+    match /moves/n4CxhHlF8sszxyy9zdYt_I1B/events/{eventId} {
+      allow read: if isMoveMember();
+      allow create: if isMoveMember() && validEvent(eventId);
+      allow update: if isMoveMember() && request.resource.data == resource.data;
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
