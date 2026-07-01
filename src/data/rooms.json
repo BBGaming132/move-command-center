@@ -1,15 +1,102 @@
 [
-  { "code": "KITCHEN", "label": "Kitchen", "active": true },
-  { "code": "LIVING", "label": "Living Room", "active": true },
-  { "code": "DINING", "label": "Dining Room", "active": true },
-  { "code": "PRIMARY", "label": "Primary Bedroom", "active": true },
-  { "code": "A", "label": "Room A", "active": true },
-  { "code": "B", "label": "Room B", "active": true },
-  { "code": "C", "label": "Room C", "active": true },
-  { "code": "D", "label": "Room D", "active": true },
-  { "code": "E", "label": "Room E", "active": true },
-  { "code": "F", "label": "Room F", "active": true },
-  { "code": "GARAGE", "label": "Garage", "active": true },
-  { "code": "STORAGE", "label": "Storage", "active": true },
-  { "code": "HOLD", "label": "Hold / Ask Before Placing", "active": true }
+  {
+    "code": "KITCHEN",
+    "label": "Kitchen",
+    "active": true
+  },
+  {
+    "code": "LIVING",
+    "label": "Living Room",
+    "active": true
+  },
+  {
+    "code": "DINING",
+    "label": "Dining Room",
+    "active": true
+  },
+  {
+    "code": "FAMILY",
+    "label": "Family Room",
+    "active": true
+  },
+  {
+    "code": "FOYER",
+    "label": "Foyer",
+    "active": true
+  },
+  {
+    "code": "GARAGE",
+    "label": "Garage",
+    "active": true
+  },
+  {
+    "code": "GUEST",
+    "label": "Guest Room",
+    "active": true
+  },
+  {
+    "code": "OFFICE",
+    "label": "Office",
+    "active": true
+  },
+  {
+    "code": "PIANO",
+    "label": "Piano Room",
+    "active": true
+  },
+  {
+    "code": "MASTER",
+    "label": "Master Bedroom",
+    "active": true
+  },
+  {
+    "code": "MASTER-BATH",
+    "label": "Master Bath",
+    "active": true
+  },
+  {
+    "code": "LINEN",
+    "label": "Linen Closet",
+    "active": true
+  },
+  {
+    "code": "A",
+    "label": "Room A",
+    "active": true
+  },
+  {
+    "code": "B",
+    "label": "Room B",
+    "active": true
+  },
+  {
+    "code": "C",
+    "label": "Room C",
+    "active": true
+  },
+  {
+    "code": "D",
+    "label": "Room D",
+    "active": true
+  },
+  {
+    "code": "E",
+    "label": "Room E",
+    "active": true
+  },
+  {
+    "code": "F",
+    "label": "Room F",
+    "active": true
+  },
+  {
+    "code": "STORAGE",
+    "label": "Storage",
+    "active": true
+  },
+  {
+    "code": "HOLD",
+    "label": "Hold / Ask Before Placing",
+    "active": true
+  }
 ]

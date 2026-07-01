@@ -11,6 +11,18 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/moves/n4CxhHlF8sszxyy9zdYt_I1B/members/$(request.auth.uid)).data.username;
     }
 
+    function isMasterItemId(itemId) {
+      return itemId is string && itemId.matches('^[1-9][0-9]{0,2}$');
+    }
+
+    function isExtraItemId(itemId) {
+      return itemId is string && itemId.matches('^EXTRA-[A-Z0-9]{8,24}$');
+    }
+
+    function validOperationalItemId(itemId) {
+      return isMasterItemId(itemId) || isExtraItemId(itemId);
+    }
+
     function validReceivedPayload() {
       return request.resource.data.payload.keys().hasOnly([]);
     }
@@ -31,7 +43,7 @@ service cloud.firestore {
 
     function validPlanPayload() {
       return request.resource.data.payload.keys().hasOnly([
-        'assignedCrateId', 'destinationCode', 'destinationLabel', 'notes'
+        'assignedCrateId', 'destinationCode', 'destinationLabel', 'notes', 'keepOriginalRoom'
       ])
         && request.resource.data.payload.assignedCrateId is string
         && request.resource.data.payload.assignedCrateId.size() <= 40
@@ -40,7 +52,57 @@ service cloud.firestore {
         && request.resource.data.payload.destinationLabel is string
         && request.resource.data.payload.destinationLabel.size() <= 120
         && request.resource.data.payload.notes is string
-        && request.resource.data.payload.notes.size() <= 2000;
+        && request.resource.data.payload.notes.size() <= 2000
+        && (!request.resource.data.payload.keys().hasAny(['keepOriginalRoom'])
+          || request.resource.data.payload.keepOriginalRoom is bool);
+    }
+
+    function validExtraItemPayload() {
+      return request.resource.data.payload.keys().hasOnly([
+        'description', 'comments', 'packType', 'observedArea',
+        'assignedCrateId', 'destinationCode', 'destinationLabel', 'notes', 'tags'
+      ])
+        && request.resource.data.payload.description is string
+        && request.resource.data.payload.description.size() > 0
+        && request.resource.data.payload.description.size() <= 300
+        && request.resource.data.payload.comments is string
+        && request.resource.data.payload.comments.size() <= 1000
+        && request.resource.data.payload.packType is string
+        && request.resource.data.payload.packType.size() > 0
+        && request.resource.data.payload.packType.size() <= 120
+        && request.resource.data.payload.observedArea is string
+        && request.resource.data.payload.observedArea.size() > 0
+        && request.resource.data.payload.observedArea.size() <= 120
+        && request.resource.data.payload.assignedCrateId is string
+        && request.resource.data.payload.assignedCrateId.size() <= 40
+        && request.resource.data.payload.destinationCode is string
+        && request.resource.data.payload.destinationCode.size() <= 40
+        && request.resource.data.payload.destinationLabel is string
+        && request.resource.data.payload.destinationLabel.size() <= 120
+        && request.resource.data.payload.notes is string
+        && request.resource.data.payload.notes.size() <= 2000
+        && request.resource.data.payload.tags is list
+        && request.resource.data.payload.tags.size() <= 30;
+    }
+
+
+    function validExtraItemVoidPayload() {
+      return request.resource.data.payload.keys().hasOnly(['reason'])
+        && request.resource.data.payload.reason is string
+        && request.resource.data.payload.reason.size() > 0
+        && request.resource.data.payload.reason.size() <= 500;
+    }
+
+    function validSettingsPayload() {
+      return request.resource.data.payload.keys().hasOnly(['hasCrateListing'])
+        && request.resource.data.payload.hasCrateListing is bool;
+    }
+
+    function validDestinationsPayload() {
+      return request.resource.data.payload.keys().hasOnly(['catalogJson'])
+        && request.resource.data.payload.catalogJson is string
+        && request.resource.data.payload.catalogJson.size() > 2
+        && request.resource.data.payload.catalogJson.size() <= 12000;
     }
 
     function validEvent(eventId) {
@@ -50,9 +112,14 @@ service cloud.firestore {
       ])
         && request.resource.data.id == eventId
         && request.resource.data.moveId == 'n4CxhHlF8sszxyy9zdYt_I1B'
-        && request.resource.data.type in ['RECEIVED', 'PLAN_UPDATE', 'ISSUE', 'RECEIPT_VOID']
-        && request.resource.data.itemId is string
-        && request.resource.data.itemId.matches('^[1-9][0-9]{0,2}$')
+        && request.resource.data.type in [
+          'RECEIVED', 'PLAN_UPDATE', 'ISSUE', 'RECEIPT_VOID', 'ITEM_ADD', 'ITEM_EDIT', 'ITEM_VOID', 'SETTINGS_UPDATE', 'DESTINATIONS_UPDATE'
+        ]
+        && ((request.resource.data.type == 'SETTINGS_UPDATE' && request.resource.data.itemId == 'MOVE-SETTINGS')
+          || (request.resource.data.type == 'DESTINATIONS_UPDATE' && request.resource.data.itemId == 'MOVE-DESTINATIONS')
+          || (request.resource.data.type != 'SETTINGS_UPDATE'
+            && request.resource.data.type != 'DESTINATIONS_UPDATE'
+            && validOperationalItemId(request.resource.data.itemId)))
         && request.resource.data.deviceId is string
         && request.resource.data.deviceId.size() > 0
         && request.resource.data.deviceId.size() <= 100
@@ -68,6 +135,11 @@ service cloud.firestore {
           || (request.resource.data.type == 'RECEIPT_VOID' && validReceiptVoidPayload())
           || (request.resource.data.type == 'ISSUE' && validIssuePayload())
           || (request.resource.data.type == 'PLAN_UPDATE' && validPlanPayload())
+          || (request.resource.data.type == 'ITEM_ADD' && isExtraItemId(request.resource.data.itemId) && validExtraItemPayload())
+          || (request.resource.data.type == 'ITEM_EDIT' && isExtraItemId(request.resource.data.itemId) && validExtraItemPayload())
+          || (request.resource.data.type == 'ITEM_VOID' && isExtraItemId(request.resource.data.itemId) && validExtraItemVoidPayload())
+          || (request.resource.data.type == 'SETTINGS_UPDATE' && request.resource.data.itemId == 'MOVE-SETTINGS' && validSettingsPayload())
+          || (request.resource.data.type == 'DESTINATIONS_UPDATE' && request.resource.data.itemId == 'MOVE-DESTINATIONS' && validDestinationsPayload())
         );
     }
 

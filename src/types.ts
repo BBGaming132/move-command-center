@@ -1,4 +1,13 @@
-export type EventType = 'RECEIVED' | 'PLAN_UPDATE' | 'ISSUE' | 'RECEIPT_VOID';
+export type EventType =
+  | 'RECEIVED'
+  | 'PLAN_UPDATE'
+  | 'ISSUE'
+  | 'RECEIPT_VOID'
+  | 'ITEM_ADD'
+  | 'ITEM_EDIT'
+  | 'ITEM_VOID'
+  | 'SETTINGS_UPDATE'
+  | 'DESTINATIONS_UPDATE';
 
 export interface InventoryMetadata {
   title: string;
@@ -45,6 +54,9 @@ export interface InventoryItem {
   sourceRow?: string;
   sourceFields: Record<string, string | number | boolean | null>;
   tags: string[];
+  isAdHoc?: boolean;
+  createdAt?: number;
+  createdBy?: string;
 }
 
 export interface InventoryBundle {
@@ -83,8 +95,16 @@ export interface DerivedItemState {
   destinationLabel?: string;
   notes?: string;
   planningUpdatedAt?: number;
+  keepOriginalRoom?: boolean;
   issueCount: number;
   latestIssue?: string;
+}
+
+
+export interface MoveSettings {
+  hasCrateListing: boolean;
+  updatedAt?: number;
+  updatedByUsername?: string;
 }
 
 export interface AppMeta {

@@ -29,6 +29,11 @@ for (const requiredIgnore of [
 
 if (!rules.includes('allow write: if false;')) throw new Error('Firestore rules do not contain the expected deny-write protections.');
 if (!rules.includes('request.resource.data.actorUid == request.auth.uid')) throw new Error('Firestore rules do not bind event actors to the authenticated UID.');
+if (!rules.includes("'ITEM_ADD'") || !rules.includes("'ITEM_EDIT'") || !rules.includes("'ITEM_VOID'")) throw new Error('Firestore rules do not allow the protected emergency-item event types.');
+if (!rules.includes("'SETTINGS_UPDATE'") || !rules.includes("'MOVE-SETTINGS'") || !rules.includes('hasCrateListing')) throw new Error('Firestore rules do not protect the shared crate-listing setting.');
+if (!rules.includes("'DESTINATIONS_UPDATE'") || !rules.includes("'MOVE-DESTINATIONS'") || !rules.includes('catalogJson')) throw new Error('Firestore rules do not protect the shared destination catalog.');
+if (!rules.includes('keepOriginalRoom')) throw new Error('Firestore rules do not allow the keep-original-room routing flag.');
+if (!rules.includes("^EXTRA-[A-Z0-9]{8,24}$")) throw new Error('Firestore rules do not restrict emergency-item identifiers.');
 
 console.log('Security configuration validation passed: move IDs, username domain, private-data exclusions, and actor rules are aligned.');
 
