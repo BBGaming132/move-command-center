@@ -118,9 +118,18 @@ let showEmergencyModal = false;
 let editingEmergencyItemId: string | undefined;
 let destinationDraft: DestinationDraftRow[] | undefined;
 const animatedReceiptIds = new Set<string>();
-let mobileLookupExpanded = false;
-let mobileLookupCollapseAt = Number.POSITIVE_INFINITY;
-let mobileLookupFrame: number | undefined;
+let floatingLookupExpanded = false;
+let floatingLookupVisible = false;
+let lookupObserver: IntersectionObserver | undefined;
+let lookupObserverFrame: number | undefined;
+let bulkPlannerOpen = false;
+let bulkPlannerSelectedRoom = '';
+let bulkPlannerKeepOriginal = false;
+let bulkPlannerCode = '';
+let bulkPlannerLabel = '';
+let bulkPlannerBusy = false;
+let bulkSyncInProgress = false;
+let bulkSyncRenderQueued = false;
 let toastMessage = '';
 let toastTimer: number | undefined;
 let cloudStatus: FirebaseRuntimeStatus = {
@@ -138,6 +147,10 @@ let applyServiceWorkerUpdate: ((reloadPage?: boolean) => Promise<void>) | undefi
 const sync = new FirebaseSync({
   onEvents: async () => {
     events = await getAllEvents();
+    if (bulkSyncInProgress) {
+      bulkSyncRenderQueued = true;
+      return;
+    }
     renderOrRefreshDuringSearch();
   },
   onInventory: async (secureInventory) => {
@@ -158,6 +171,10 @@ const sync = new FirebaseSync({
   },
   onStatus: (status) => {
     cloudStatus = status;
+    if (bulkSyncInProgress) {
+      bulkSyncRenderQueued = true;
+      return;
+    }
     renderOrRefreshDuringSearch();
   }
 });
@@ -215,11 +232,8 @@ async function initialize(): Promise<void> {
   });
   window.addEventListener('online', render);
   window.addEventListener('offline', render);
-  window.addEventListener('scroll', scheduleMobileLookupSync, { passive: true });
-  window.addEventListener('resize', () => {
-    if (document.activeElement?.id === 'search-input') scheduleMobileLookupSync();
-    else scheduleMobileLookupMeasure();
-  });
+  window.addEventListener('resize', scheduleLookupObserver);
+  window.addEventListener('orientationchange', scheduleLookupObserver);
 
   attachGlobalHandlers();
   render();
@@ -229,12 +243,12 @@ async function initialize(): Promise<void> {
 function render(): void {
   if (!cloudStatus.enabled) {
     appRoot.innerHTML = renderSetupGate();
-    clearMobileLookupLayout();
+    clearFloatingLookupLayout();
     return;
   }
   if (!cloudStatus.authReady) {
     appRoot.innerHTML = renderSecureLoading('Restoring the saved device session…');
-    clearMobileLookupLayout();
+    clearFloatingLookupLayout();
     return;
   }
 
@@ -248,14 +262,14 @@ function render(): void {
 
   if (!cloudStatus.authenticated) {
     appRoot.innerHTML = renderLoginGate();
-    clearMobileLookupLayout();
+    clearFloatingLookupLayout();
     return;
   }
   if (!accessGranted) {
     appRoot.innerHTML = cloudStatus.lastError
       ? renderAccessDenied()
       : renderSecureLoading('Checking this account’s move access…');
-    clearMobileLookupLayout();
+    clearFloatingLookupLayout();
     return;
   }
   if (!inventoryCached || inventory.items.length === 0) {
@@ -264,9 +278,12 @@ function render(): void {
         ? 'Downloading the private 388-piece inventory to this device…'
         : 'This device has not downloaded the inventory yet. Connect once, then reopen the app.'
     );
-    clearMobileLookupLayout();
+    clearFloatingLookupLayout();
     return;
   }
+
+  lookupObserver?.disconnect();
+  lookupObserver = undefined;
 
   const crateListing = crateFeaturesEnabled();
   normalizeCrateUiState(crateListing);
@@ -326,75 +343,126 @@ function render(): void {
     ${showEmergencyModal ? renderEmergencyModal(workingItems, states) : ''}
     ${toastMessage ? `<div class="success-toast" role="status" aria-live="polite">${icon('check')}<span>${escapeHtml(toastMessage)}</span></div>` : ''}
   `;
-  scheduleMobileLookupMeasure();
+  scheduleLookupObserver();
 }
 
-function scheduleMobileLookupMeasure(): void {
-  window.requestAnimationFrame(() => {
-    const controls = document.querySelector<HTMLElement>('.sticky-controls');
-    if (!controls || !window.matchMedia('(max-width: 700px)').matches || mode === 'readiness') {
-      clearMobileLookupLayout();
-      return;
-    }
-
-    const stickyTop = Number.parseFloat(window.getComputedStyle(controls).top) || 0;
-    mobileLookupCollapseAt = getDocumentTop(controls) - stickyTop + 8;
-    syncMobileLookupLayout();
+function scheduleLookupObserver(): void {
+  if (lookupObserverFrame !== undefined) window.cancelAnimationFrame(lookupObserverFrame);
+  lookupObserverFrame = window.requestAnimationFrame(() => {
+    lookupObserverFrame = undefined;
+    setupLookupObserver();
   });
 }
 
-function scheduleMobileLookupSync(): void {
-  if (mobileLookupFrame !== undefined) return;
-  mobileLookupFrame = window.requestAnimationFrame(() => {
-    mobileLookupFrame = undefined;
-    syncMobileLookupLayout();
-  });
-}
+function setupLookupObserver(): void {
+  lookupObserver?.disconnect();
+  lookupObserver = undefined;
 
-function syncMobileLookupLayout(): void {
-  const root = document.documentElement;
-  const controls = document.querySelector<HTMLElement>('.sticky-controls');
-  const mobile = window.matchMedia('(max-width: 700px)').matches;
-
-  if (!mobile || !controls || mode === 'readiness' || !Number.isFinite(mobileLookupCollapseAt)) {
-    clearMobileLookupLayout();
+  const sentinel = document.querySelector<HTMLElement>('.lookup-sentinel');
+  if (!sentinel || mode === 'readiness') {
+    setFloatingLookupVisible(false);
     return;
   }
 
-  const condensed = Boolean(queryText.trim()) || window.scrollY >= mobileLookupCollapseAt;
-  if (!condensed) mobileLookupExpanded = false;
+  const updateFromPosition = (): void => {
+    const shouldFloat = sentinel.getBoundingClientRect().top <= 0;
+    setFloatingLookupVisible(shouldFloat);
+  };
 
-  root.classList.toggle('mobile-lookup-condensed', condensed);
-  root.classList.toggle('mobile-lookup-expanded', condensed && mobileLookupExpanded);
-  controls.classList.toggle('is-mobile-condensed', condensed);
+  lookupObserver = new IntersectionObserver(
+    (entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const shouldFloat = !entry.isIntersecting && entry.boundingClientRect.top < 0;
+      setFloatingLookupVisible(shouldFloat);
+    },
+    { threshold: 0 }
+  );
+  lookupObserver.observe(sentinel);
+  updateFromPosition();
+}
 
-  const toggle = controls.querySelector<HTMLButtonElement>('.mobile-lookup-toggle');
+function setFloatingLookupVisible(visible: boolean): void {
+  floatingLookupVisible = visible;
+  if (!visible) floatingLookupExpanded = false;
+  document.documentElement.classList.toggle('lookup-floating-active', visible);
+  syncFloatingLookupUi();
+}
+
+function mountFloatingLookup(): void {
+  const host = document.querySelector<HTMLElement>('#floating-lookup-host');
+  const source = document.querySelector<HTMLElement>('.sticky-controls');
+  if (!host || !source) return;
+
+  const existing = host.querySelector<HTMLElement>('.floating-lookup');
+  if (existing) {
+    existing.classList.toggle('is-expanded', floatingLookupExpanded);
+    existing.setAttribute('aria-hidden', String(!floatingLookupVisible));
+    return;
+  }
+
+  const clone = source.cloneNode(true) as HTMLElement;
+  clone.classList.add('floating-lookup');
+  clone.classList.remove('has-exact-result');
+  clone.setAttribute('aria-label', 'Floating inventory lookup');
+  clone.setAttribute('aria-hidden', String(!floatingLookupVisible));
+
+  clone.querySelectorAll<HTMLElement>('[id]').forEach((element) => {
+    const sourceId = element.id;
+    element.dataset.sourceId = sourceId;
+    element.id = `floating-${sourceId}`;
+  });
+  clone.querySelectorAll<HTMLLabelElement>('label[for]').forEach((label) => {
+    const forId = label.htmlFor;
+    if (forId) label.htmlFor = `floating-${forId}`;
+  });
+
+  clone.classList.toggle('is-expanded', floatingLookupExpanded);
+  host.replaceChildren(clone);
+}
+
+function syncFloatingLookupUi(): void {
+  const host = document.querySelector<HTMLElement>('#floating-lookup-host');
+  if (!host) return;
+
+  if (!floatingLookupVisible) {
+    host.replaceChildren();
+    return;
+  }
+
+  mountFloatingLookup();
+  const floating = host.querySelector<HTMLElement>('.floating-lookup');
+  if (!floating) return;
+
+  floating.classList.toggle('is-expanded', floatingLookupExpanded);
+  floating.setAttribute('aria-hidden', 'false');
+
+  floating.querySelectorAll<HTMLInputElement>('[data-search-input]').forEach((input) => {
+    if (input.value !== queryText) input.value = queryText;
+  });
+  floating.querySelectorAll<HTMLButtonElement>('.search-clear').forEach((button) => {
+    button.hidden = !queryText;
+  });
+
+  const toggle = floating.querySelector<HTMLButtonElement>('.mobile-lookup-toggle');
   const label = toggle?.querySelector<HTMLElement>('.mobile-lookup-toggle-label');
   const chevron = toggle?.querySelector<HTMLElement>('.mobile-lookup-chevron');
-  const expanded = condensed && mobileLookupExpanded;
-  toggle?.setAttribute('aria-expanded', String(expanded));
-  if (label) label.textContent = expanded ? 'Hide views & filters' : 'Views & filters';
-  if (chevron) chevron.textContent = expanded ? '▲' : '▼';
+  toggle?.setAttribute('aria-expanded', String(floatingLookupExpanded));
+  if (label) label.textContent = floatingLookupExpanded ? 'Hide views & filters' : 'Views & filters';
+  if (chevron) chevron.textContent = floatingLookupExpanded ? '▲' : '▼';
 }
 
-function clearMobileLookupLayout(): void {
-  document.documentElement.classList.remove('mobile-lookup-condensed', 'mobile-lookup-expanded');
-  document.querySelector<HTMLElement>('.sticky-controls')?.classList.remove('is-mobile-condensed');
-  mobileLookupCollapseAt = Number.POSITIVE_INFINITY;
-}
-
-function getDocumentTop(element: HTMLElement): number {
-  let top = 0;
-  let current: HTMLElement | null = element;
-  while (current) {
-    top += current.offsetTop;
-    current = current.offsetParent as HTMLElement | null;
-  }
-  return top;
+function clearFloatingLookupLayout(): void {
+  lookupObserver?.disconnect();
+  lookupObserver = undefined;
+  floatingLookupVisible = false;
+  floatingLookupExpanded = false;
+  document.documentElement.classList.remove('lookup-floating-active');
+  document.querySelector<HTMLElement>('#floating-lookup-host')?.replaceChildren();
 }
 
 function renderOrRefreshDuringSearch(): void {
-  if (document.activeElement?.id === 'search-input' && mode !== 'readiness') {
+  if (isSearchInput(document.activeElement) && mode !== 'readiness') {
     deferredFullRender = true;
     refreshSearchResults();
     return;
@@ -406,6 +474,17 @@ function renderPreservingScroll(): void {
   const scrollY = window.scrollY;
   render();
   window.requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'auto' }));
+}
+
+function renderPreservingElementPosition(selector: string): void {
+  const before = document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().top;
+  render();
+  if (before === undefined) return;
+  window.requestAnimationFrame(() => {
+    const after = document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().top;
+    if (after === undefined) return;
+    window.scrollBy({ top: after - before, behavior: 'auto' });
+  });
 }
 
 function refreshSearchResults(): void {
@@ -424,11 +503,13 @@ function refreshSearchResults(): void {
     element.textContent = visibleEntries.length === 1 ? 'result' : 'results';
   });
 
-  const clearButton = document.querySelector<HTMLButtonElement>('.search-clear');
-  if (clearButton) clearButton.hidden = !queryText;
+  document.querySelectorAll<HTMLButtonElement>('.search-clear').forEach((button) => {
+    button.hidden = !queryText;
+  });
 
-  const controls = document.querySelector<HTMLElement>('.sticky-controls');
-  controls?.classList.toggle('has-exact-result', exactResult);
+  document.querySelectorAll<HTMLElement>('.sticky-controls, .floating-lookup').forEach((controls) => {
+    controls.classList.toggle('has-exact-result', exactResult);
+  });
 
   const exactRegion = document.querySelector<HTMLElement>('#exact-match-region');
   if (exactRegion) exactRegion.innerHTML = exactResult && exactEntry ? renderExactMatchCallout(exactEntry) : '';
@@ -438,19 +519,11 @@ function refreshSearchResults(): void {
     resultRegion.innerHTML = `${groups.map((group) => renderGroup(group)).join('')}${visibleEntries.length === 0 ? renderEmptyState() : ''}`;
   }
 
-  syncMobileLookupLayout();
+  syncFloatingLookupUi();
 }
 
-function pinMobileSearchToTop(): void {
-  if (!window.matchMedia('(max-width: 700px)').matches) return;
-  const controls = document.querySelector<HTMLElement>('.sticky-controls');
-  if (!controls) return;
-  const stickyTop = Number.parseFloat(window.getComputedStyle(controls).top) || 0;
-  const rect = controls.getBoundingClientRect();
-  if (rect.top > stickyTop + 6) {
-    window.scrollBy({ top: rect.top - stickyTop - 6, left: 0, behavior: 'auto' });
-  }
-  syncMobileLookupLayout();
+function isSearchInput(element: Element | null): boolean {
+  return element instanceof HTMLInputElement && element.matches('[data-search-input]');
 }
 
 function renderSetupGate(): string {
@@ -745,13 +818,13 @@ function renderWorkMode(
       <label class="search-box enhanced-search">
         ${icon('search')}
         <span class="sr-only">Search inventory</span>
-        <input id="search-input" type="search" value="${escapeHtml(queryText)}" placeholder="2 = Item 2 · piano · pack:3.1 · 1-40" autocomplete="off" inputmode="search" enterkeyhint="search" />
+        <input id="search-input" data-search-input type="search" value="${escapeHtml(queryText)}" placeholder="2 = Item 2 · piano · pack:3.1 · 1-40" autocomplete="off" inputmode="search" enterkeyhint="search" />
         <button type="button" class="search-clear" data-action="clear-search" aria-label="Clear search" ${queryText ? '' : 'hidden'}>×</button>
       </label>
       <div class="mobile-lookup-toolbar">
         <span class="mobile-result-count"><strong data-search-count>${visibleEntries.length}</strong> <span data-search-noun>result${visibleEntries.length === 1 ? '' : 's'}</span></span>
-        <button type="button" class="mobile-lookup-toggle" data-action="toggle-mobile-lookup" aria-expanded="${mobileLookupExpanded ? 'true' : 'false'}">
-          ${icon('filter')}<span class="mobile-lookup-toggle-label">${mobileLookupExpanded ? 'Hide views & filters' : 'Views & filters'}</span><span class="mobile-lookup-chevron" aria-hidden="true">${mobileLookupExpanded ? '▲' : '▼'}</span>
+        <button type="button" class="mobile-lookup-toggle" data-action="toggle-floating-lookup" aria-expanded="${floatingLookupExpanded ? 'true' : 'false'}">
+          ${icon('filter')}<span class="mobile-lookup-toggle-label">${floatingLookupExpanded ? 'Hide views & filters' : 'Views & filters'}</span><span class="mobile-lookup-chevron" aria-hidden="true">${floatingLookupExpanded ? '▲' : '▼'}</span>
         </button>
       </div>
       <div class="lookup-options">
@@ -795,6 +868,8 @@ function renderWorkMode(
         </details>
       </div>
     </section>
+    <div class="lookup-sentinel" aria-hidden="true"></div>
+    <div id="floating-lookup-host" aria-live="polite"></div>
 
     <div id="exact-match-region">${exactResult && exactEntry ? renderExactMatchCallout(exactEntry) : ''}</div>
 
@@ -1062,24 +1137,30 @@ function renderPlanningActions(item: InventoryItem, state: DerivedItemState): st
 
 function renderBulkTools(items: InventoryItem[]): string {
   const originalRooms = getOriginalRooms(items);
+  const selectedRoom = originalRooms.includes(bulkPlannerSelectedRoom)
+    ? bulkPlannerSelectedRoom
+    : (originalRooms[0] ?? '');
+  if (selectedRoom !== bulkPlannerSelectedRoom) bulkPlannerSelectedRoom = selectedRoom;
+  const buttonLabel = bulkPlannerBusy ? 'Saving room assignment…' : 'Apply to every piece in this old room';
   return `
-    <details class="bulk-panel">
+    <details class="bulk-panel" ${bulkPlannerOpen ? 'open' : ''}>
       <summary>${icon('room')} Fast planning tools</summary>
       <div class="bulk-grid">
         <section>
           <h3>Route an entire old room</h3>
           <p>Keep unchanged rooms exactly as they were, or assign a new shared destination code and label. Individual exceptions can still be changed later.</p>
-          <label><span>Original room</span><select id="bulk-room">${originalRooms.map((room) => `<option>${escapeHtml(room)}</option>`).join('')}</select></label>
+          <label><span>Original room</span><select id="bulk-room" ${bulkPlannerBusy ? 'disabled' : ''}>${originalRooms.map((room) => `<option value="${escapeHtml(room)}" ${room === selectedRoom ? 'selected' : ''}>${escapeHtml(room)}</option>`).join('')}</select></label>
           <label class="keep-original-control bulk-keep-original">
-            <input id="bulk-keep-original" type="checkbox" />
+            <input id="bulk-keep-original" type="checkbox" ${bulkPlannerKeepOriginal ? 'checked' : ''} ${bulkPlannerBusy ? 'disabled' : ''} />
             <span class="keep-original-icon">${icon('keep')}</span>
             <span><b>Keep original room name</b><small>Example: Kitchen stays Kitchen, Master Bedroom stays Master Bedroom.</small></span>
           </label>
-          <div id="bulk-custom-destination" class="bulk-custom-destination">
-            <label><span>New destination code</span><input id="bulk-code" list="room-options" placeholder="A, B, STORAGE…" /></label>
-            <label><span>New destination label</span><input id="bulk-label" placeholder="Room A" /></label>
+          <div id="bulk-custom-destination" class="bulk-custom-destination ${bulkPlannerKeepOriginal ? 'is-disabled' : ''}">
+            <label><span>New destination code</span><input id="bulk-code" list="room-options" value="${escapeHtml(bulkPlannerCode)}" placeholder="A, B, STORAGE…" ${bulkPlannerKeepOriginal || bulkPlannerBusy ? 'disabled' : ''} /></label>
+            <label><span>New destination label</span><input id="bulk-label" value="${escapeHtml(bulkPlannerLabel)}" placeholder="Room A" ${bulkPlannerKeepOriginal || bulkPlannerBusy ? 'disabled' : ''} /></label>
           </div>
-          <button class="primary-button" data-action="bulk-route-room">${icon('route')} Apply to every piece in this old room</button>
+          <button class="primary-button bulk-route-button ${bulkPlannerBusy ? 'is-busy' : ''}" data-action="bulk-route-room" ${bulkPlannerBusy ? 'disabled aria-busy="true"' : ''}>${icon(bulkPlannerBusy ? 'progress' : 'route')} ${buttonLabel}</button>
+          <p class="bulk-save-note" aria-live="polite">The planner stays open while room events sync, so you can continue directly to the next room.</p>
         </section>
         ${crateFeaturesEnabled() ? `<section>
           <h3>Assign a documented item range to a crate</h3>
@@ -1155,7 +1236,7 @@ function attachGlobalHandlers(): void {
     const itemId = button.dataset.itemId;
 
     if (action === 'set-mode') {
-      mobileLookupExpanded = false;
+      floatingLookupExpanded = false;
       mode = button.dataset.mode as Mode;
       if (mode === 'live' && filter === 'all' && !queryText) filter = 'remaining';
       if (mode === 'planning' && filter === 'remaining') filter = 'all';
@@ -1163,13 +1244,13 @@ function attachGlobalHandlers(): void {
       return;
     }
     if (action === 'set-view') {
-      mobileLookupExpanded = false;
+      floatingLookupExpanded = false;
       applyViewPreset(button.dataset.view ?? 'number');
       render();
       return;
     }
     if (action === 'set-filter') {
-      mobileLookupExpanded = false;
+      floatingLookupExpanded = false;
       filter = button.dataset.filter as StatusFilter;
       if (filter === 'received') {
         groupBy = 'none';
@@ -1178,18 +1259,20 @@ function attachGlobalHandlers(): void {
       render();
       return;
     }
-    if (action === 'toggle-mobile-lookup') {
-      mobileLookupExpanded = !mobileLookupExpanded;
-      syncMobileLookupLayout();
+    if (action === 'toggle-floating-lookup') {
+      floatingLookupExpanded = !floatingLookupExpanded;
+      syncFloatingLookupUi();
       return;
     }
     if (action === 'clear-search') {
       queryText = '';
-      mobileLookupExpanded = false;
-      const searchInput = document.querySelector<HTMLInputElement>('#search-input');
-      if (searchInput) searchInput.value = '';
+      floatingLookupExpanded = false;
+      const activeSearch = isSearchInput(document.activeElement) ? document.activeElement as HTMLInputElement : undefined;
+      document.querySelectorAll<HTMLInputElement>('[data-search-input]').forEach((input) => {
+        input.value = '';
+      });
       refreshSearchResults();
-      requestAnimationFrame(() => searchInput?.focus());
+      requestAnimationFrame(() => activeSearch?.focus());
       return;
     }
     if (action === 'clear-filters') {
@@ -1306,6 +1389,12 @@ function attachGlobalHandlers(): void {
     if (action === 'print-checklist') printDayOfChecklist();
   });
 
+  appRoot.addEventListener('toggle', (event) => {
+    const details = event.target as HTMLDetailsElement;
+    if (!details.matches('.bulk-panel')) return;
+    bulkPlannerOpen = details.open;
+  }, true);
+
   appRoot.addEventListener('submit', async (event) => {
     const form = event.target as HTMLFormElement;
     if (form.id === 'login-form') {
@@ -1334,22 +1423,34 @@ function attachGlobalHandlers(): void {
 
   appRoot.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
-    if (input.id === 'search-input') {
-      const wasEmpty = !queryText.trim();
-      queryText = input.value;
-      mobileLookupExpanded = false;
-      if (wasEmpty && queryText.trim()) window.requestAnimationFrame(pinMobileSearchToTop);
-      window.clearTimeout(searchTimer);
-      searchTimer = window.setTimeout(refreshSearchResults, 120);
-      syncMobileLookupLayout();
+    const sourceId = input.dataset.sourceId ?? input.id;
+
+    if (sourceId === 'bulk-code') {
+      bulkPlannerCode = input.value.toUpperCase();
+      return;
+    }
+    if (sourceId === 'bulk-label') {
+      bulkPlannerLabel = input.value;
       return;
     }
 
-    if (input.id === 'filter-range-from') {
+    if (isSearchInput(input)) {
+      queryText = input.value;
+      floatingLookupExpanded = false;
+      document.querySelectorAll<HTMLInputElement>('[data-search-input]').forEach((peer) => {
+        if (peer !== input && peer.value !== queryText) peer.value = queryText;
+      });
+      window.clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(refreshSearchResults, 120);
+      syncFloatingLookupUi();
+      return;
+    }
+
+    if (sourceId === 'filter-range-from') {
       filters.rangeFrom = input.value;
       renderPreservingFocus(input.id);
     }
-    if (input.id === 'filter-range-to') {
+    if (sourceId === 'filter-range-to') {
       filters.rangeTo = input.value;
       renderPreservingFocus(input.id);
     }
@@ -1357,16 +1458,16 @@ function attachGlobalHandlers(): void {
 
   appRoot.addEventListener('focusin', (event) => {
     const input = event.target as HTMLInputElement;
-    if (input.id !== 'search-input') return;
-    mobileLookupExpanded = false;
-    syncMobileLookupLayout();
+    if (!isSearchInput(input)) return;
+    floatingLookupExpanded = false;
+    syncFloatingLookupUi();
   });
 
   appRoot.addEventListener('focusout', (event) => {
     const input = event.target as HTMLInputElement;
-    if (input.id !== 'search-input' || !deferredFullRender) return;
+    if (!isSearchInput(input) || !deferredFullRender) return;
     window.setTimeout(() => {
-      if (document.activeElement?.id === 'search-input') return;
+      if (isSearchInput(document.activeElement)) return;
       deferredFullRender = false;
       renderPreservingScroll();
     }, 180);
@@ -1374,30 +1475,36 @@ function attachGlobalHandlers(): void {
 
   appRoot.addEventListener('change', (event) => {
     const input = event.target as HTMLInputElement | HTMLSelectElement;
-    if (input.id.startsWith('code-')) {
+    const sourceId = input.dataset.sourceId ?? input.id;
+    if (sourceId.startsWith('code-')) {
       const itemId = input.closest<HTMLElement>('[data-item-id]')?.dataset.itemId;
       if (itemId) fillRoomLabel(input.value, `#label-${safeId(itemId)}`);
       return;
     }
-    if (input.id === 'emergency-code') {
+    if (sourceId === 'emergency-code') {
       fillRoomLabel(input.value, '#emergency-label');
       return;
     }
-    if (input.id.startsWith('keep-original-')) {
+    if (sourceId.startsWith('keep-original-')) {
       const itemId = input.closest<HTMLElement>('[data-item-id]')?.dataset.itemId;
       if (itemId) toggleItemDestinationInputs(itemId, (input as HTMLInputElement).checked);
       return;
     }
-    if (input.id === 'bulk-keep-original') {
-      toggleBulkDestinationInputs((input as HTMLInputElement).checked);
+    if (sourceId === 'bulk-room') {
+      bulkPlannerSelectedRoom = input.value;
       return;
     }
-    if (input.id === 'filter-room') filters.originalRoom = input.value;
-    else if (input.id === 'filter-pack') filters.packType = input.value;
-    else if (input.id === 'filter-destination') filters.destination = input.value;
-    else if (input.id === 'filter-crate') filters.crate = input.value;
-    else if (input.id === 'group-select') groupBy = input.value as GroupBy;
-    else if (input.id === 'sort-select') sortBy = input.value as SortBy;
+    if (sourceId === 'bulk-keep-original') {
+      bulkPlannerKeepOriginal = (input as HTMLInputElement).checked;
+      toggleBulkDestinationInputs(bulkPlannerKeepOriginal);
+      return;
+    }
+    if (sourceId === 'filter-room') filters.originalRoom = input.value;
+    else if (sourceId === 'filter-pack') filters.packType = input.value;
+    else if (sourceId === 'filter-destination') filters.destination = input.value;
+    else if (sourceId === 'filter-crate') filters.crate = input.value;
+    else if (sourceId === 'group-select') groupBy = input.value as GroupBy;
+    else if (sourceId === 'sort-select') sortBy = input.value as SortBy;
     else return;
     render();
   });
@@ -1557,13 +1664,19 @@ async function saveSharedMoveSettings(): Promise<void> {
 }
 
 function renderPreservingFocus(id: string): void {
-  const value = (document.querySelector<HTMLInputElement>(`#${id}`)?.value ?? '');
-  const selection = document.querySelector<HTMLInputElement>(`#${id}`)?.selectionStart ?? value.length;
+  const current = document.querySelector<HTMLInputElement>(`#${id}`);
+  const sourceId = current?.dataset.sourceId;
+  const value = current?.value ?? '';
+  const selection = current?.selectionStart ?? value.length;
   render();
   requestAnimationFrame(() => {
-    const replacement = document.querySelector<HTMLInputElement>(`#${id}`);
-    replacement?.focus();
-    replacement?.setSelectionRange(selection, selection);
+    requestAnimationFrame(() => {
+      const replacement =
+        document.querySelector<HTMLInputElement>(`#${id}`) ??
+        (sourceId ? document.querySelector<HTMLInputElement>(`#${sourceId}`) : undefined);
+      replacement?.focus();
+      replacement?.setSelectionRange(selection, selection);
+    });
   });
 }
 
@@ -1696,11 +1809,21 @@ function createEmergencyTags(...values: string[]): string[] {
 }
 
 async function bulkRouteRoom(): Promise<void> {
-  const originalRoom = document.querySelector<HTMLSelectElement>('#bulk-room')?.value ?? '';
-  const keepOriginalRoom = document.querySelector<HTMLInputElement>('#bulk-keep-original')?.checked ?? false;
-  const code = keepOriginalRoom ? '' : (document.querySelector<HTMLInputElement>('#bulk-code')?.value.trim().toUpperCase() ?? '');
+  if (bulkPlannerBusy) return;
+  const originalRoom = document.querySelector<HTMLSelectElement>('#bulk-room')?.value ?? bulkPlannerSelectedRoom;
+  const keepOriginalRoom = document.querySelector<HTMLInputElement>('#bulk-keep-original')?.checked ?? bulkPlannerKeepOriginal;
+  const rawCode = document.querySelector<HTMLInputElement>('#bulk-code')?.value ?? bulkPlannerCode;
+  const rawLabel = document.querySelector<HTMLInputElement>('#bulk-label')?.value ?? bulkPlannerLabel;
+  const code = keepOriginalRoom ? '' : rawCode.trim().toUpperCase();
   const roomOption = getDestinationCatalog().find((candidate) => candidate.code.toUpperCase() === code);
-  const label = keepOriginalRoom ? '' : (document.querySelector<HTMLInputElement>('#bulk-label')?.value.trim() || roomOption?.label || '');
+  const label = keepOriginalRoom ? '' : (rawLabel.trim() || roomOption?.label || '');
+
+  bulkPlannerOpen = true;
+  bulkPlannerSelectedRoom = originalRoom;
+  bulkPlannerKeepOriginal = keepOriginalRoom;
+  bulkPlannerCode = rawCode;
+  bulkPlannerLabel = rawLabel;
+
   if (!originalRoom) {
     window.alert('Choose an original room.');
     return;
@@ -1712,6 +1835,10 @@ async function bulkRouteRoom(): Promise<void> {
   const targets = getWorkingItems().filter((item) => item.originalRoom === originalRoom);
   const destinationDescription = keepOriginalRoom ? `keep “${originalRoom}” as the final room` : `apply ${code} (${label})`;
   if (!window.confirm(`${destinationDescription} for all ${targets.length} pieces originally listed in ${originalRoom}?`)) return;
+
+  bulkPlannerBusy = true;
+  renderPreservingElementPosition('.bulk-panel');
+
   const newEvents = targets.map((item, index) => {
     const state = deriveItemState(item.itemId, events);
     return {
@@ -1757,11 +1884,34 @@ async function bulkAssignCrate(): Promise<void> {
 }
 
 async function saveBulkEvents(newEvents: MoveEvent[], confirmation: string): Promise<void> {
-  await putEvents(newEvents);
-  events = await getAllEvents();
-  render();
-  await sync.flushLocalEvents();
-  window.alert(confirmation);
+  bulkSyncInProgress = true;
+  bulkSyncRenderQueued = false;
+  bulkPlannerOpen = true;
+  let syncQueuedOffline = false;
+  try {
+    await putEvents(newEvents);
+    events = await getAllEvents();
+    toastMessage = confirmation;
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => {
+      toastMessage = '';
+      renderPreservingElementPosition('.bulk-panel');
+    }, 3200);
+    renderPreservingElementPosition('.bulk-panel');
+    try {
+      await sync.flushLocalEvents();
+    } catch (error) {
+      syncQueuedOffline = true;
+      console.warn('Bulk room events remain saved locally and will sync after reconnecting.', error);
+    }
+  } finally {
+    bulkSyncInProgress = false;
+    bulkPlannerBusy = false;
+    if (bulkSyncRenderQueued) events = await getAllEvents();
+    bulkSyncRenderQueued = false;
+    if (syncQueuedOffline) toastMessage = `${confirmation} Saved locally; cloud sync will retry automatically.`;
+    renderPreservingElementPosition('.bulk-panel');
+  }
 }
 
 async function saveDeviceNameFromSettings(): Promise<void> {
