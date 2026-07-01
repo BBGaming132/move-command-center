@@ -110,6 +110,7 @@ let serviceWorkerReady = false;
 let updateAvailable = false;
 const RECEIPT_GRACE_MS = 10_000;
 let searchTimer: number | undefined;
+let deferredFullRender = false;
 let receiptGraceTimer: number | undefined;
 let loginBusy = false;
 let showSettings = false;
@@ -117,6 +118,9 @@ let showEmergencyModal = false;
 let editingEmergencyItemId: string | undefined;
 let destinationDraft: DestinationDraftRow[] | undefined;
 const animatedReceiptIds = new Set<string>();
+let mobileLookupExpanded = false;
+let mobileLookupCollapseAt = Number.POSITIVE_INFINITY;
+let mobileLookupFrame: number | undefined;
 let toastMessage = '';
 let toastTimer: number | undefined;
 let cloudStatus: FirebaseRuntimeStatus = {
@@ -134,7 +138,7 @@ let applyServiceWorkerUpdate: ((reloadPage?: boolean) => Promise<void>) | undefi
 const sync = new FirebaseSync({
   onEvents: async () => {
     events = await getAllEvents();
-    render();
+    renderOrRefreshDuringSearch();
   },
   onInventory: async (secureInventory) => {
     verifyRuntimeInventory(secureInventory);
@@ -154,7 +158,7 @@ const sync = new FirebaseSync({
   },
   onStatus: (status) => {
     cloudStatus = status;
-    render();
+    renderOrRefreshDuringSearch();
   }
 });
 
@@ -211,6 +215,11 @@ async function initialize(): Promise<void> {
   });
   window.addEventListener('online', render);
   window.addEventListener('offline', render);
+  window.addEventListener('scroll', scheduleMobileLookupSync, { passive: true });
+  window.addEventListener('resize', () => {
+    if (document.activeElement?.id === 'search-input') scheduleMobileLookupSync();
+    else scheduleMobileLookupMeasure();
+  });
 
   attachGlobalHandlers();
   render();
@@ -220,10 +229,12 @@ async function initialize(): Promise<void> {
 function render(): void {
   if (!cloudStatus.enabled) {
     appRoot.innerHTML = renderSetupGate();
+    clearMobileLookupLayout();
     return;
   }
   if (!cloudStatus.authReady) {
     appRoot.innerHTML = renderSecureLoading('Restoring the saved device session…');
+    clearMobileLookupLayout();
     return;
   }
 
@@ -237,12 +248,14 @@ function render(): void {
 
   if (!cloudStatus.authenticated) {
     appRoot.innerHTML = renderLoginGate();
+    clearMobileLookupLayout();
     return;
   }
   if (!accessGranted) {
     appRoot.innerHTML = cloudStatus.lastError
       ? renderAccessDenied()
       : renderSecureLoading('Checking this account’s move access…');
+    clearMobileLookupLayout();
     return;
   }
   if (!inventoryCached || inventory.items.length === 0) {
@@ -251,6 +264,7 @@ function render(): void {
         ? 'Downloading the private 388-piece inventory to this device…'
         : 'This device has not downloaded the inventory yet. Connect once, then reopen the app.'
     );
+    clearMobileLookupLayout();
     return;
   }
 
@@ -312,6 +326,131 @@ function render(): void {
     ${showEmergencyModal ? renderEmergencyModal(workingItems, states) : ''}
     ${toastMessage ? `<div class="success-toast" role="status" aria-live="polite">${icon('check')}<span>${escapeHtml(toastMessage)}</span></div>` : ''}
   `;
+  scheduleMobileLookupMeasure();
+}
+
+function scheduleMobileLookupMeasure(): void {
+  window.requestAnimationFrame(() => {
+    const controls = document.querySelector<HTMLElement>('.sticky-controls');
+    if (!controls || !window.matchMedia('(max-width: 700px)').matches || mode === 'readiness') {
+      clearMobileLookupLayout();
+      return;
+    }
+
+    const stickyTop = Number.parseFloat(window.getComputedStyle(controls).top) || 0;
+    mobileLookupCollapseAt = getDocumentTop(controls) - stickyTop + 8;
+    syncMobileLookupLayout();
+  });
+}
+
+function scheduleMobileLookupSync(): void {
+  if (mobileLookupFrame !== undefined) return;
+  mobileLookupFrame = window.requestAnimationFrame(() => {
+    mobileLookupFrame = undefined;
+    syncMobileLookupLayout();
+  });
+}
+
+function syncMobileLookupLayout(): void {
+  const root = document.documentElement;
+  const controls = document.querySelector<HTMLElement>('.sticky-controls');
+  const mobile = window.matchMedia('(max-width: 700px)').matches;
+
+  if (!mobile || !controls || mode === 'readiness' || !Number.isFinite(mobileLookupCollapseAt)) {
+    clearMobileLookupLayout();
+    return;
+  }
+
+  const condensed = Boolean(queryText.trim()) || window.scrollY >= mobileLookupCollapseAt;
+  if (!condensed) mobileLookupExpanded = false;
+
+  root.classList.toggle('mobile-lookup-condensed', condensed);
+  root.classList.toggle('mobile-lookup-expanded', condensed && mobileLookupExpanded);
+  controls.classList.toggle('is-mobile-condensed', condensed);
+
+  const toggle = controls.querySelector<HTMLButtonElement>('.mobile-lookup-toggle');
+  const label = toggle?.querySelector<HTMLElement>('.mobile-lookup-toggle-label');
+  const chevron = toggle?.querySelector<HTMLElement>('.mobile-lookup-chevron');
+  const expanded = condensed && mobileLookupExpanded;
+  toggle?.setAttribute('aria-expanded', String(expanded));
+  if (label) label.textContent = expanded ? 'Hide views & filters' : 'Views & filters';
+  if (chevron) chevron.textContent = expanded ? '▲' : '▼';
+}
+
+function clearMobileLookupLayout(): void {
+  document.documentElement.classList.remove('mobile-lookup-condensed', 'mobile-lookup-expanded');
+  document.querySelector<HTMLElement>('.sticky-controls')?.classList.remove('is-mobile-condensed');
+  mobileLookupCollapseAt = Number.POSITIVE_INFINITY;
+}
+
+function getDocumentTop(element: HTMLElement): number {
+  let top = 0;
+  let current: HTMLElement | null = element;
+  while (current) {
+    top += current.offsetTop;
+    current = current.offsetParent as HTMLElement | null;
+  }
+  return top;
+}
+
+function renderOrRefreshDuringSearch(): void {
+  if (document.activeElement?.id === 'search-input' && mode !== 'readiness') {
+    deferredFullRender = true;
+    refreshSearchResults();
+    return;
+  }
+  render();
+}
+
+function renderPreservingScroll(): void {
+  const scrollY = window.scrollY;
+  render();
+  window.requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'auto' }));
+}
+
+function refreshSearchResults(): void {
+  if (mode === 'readiness' || !inventoryCached) return;
+  const workingItems = getWorkingItems();
+  const states = buildStates(workingItems);
+  const visibleEntries = buildVisibleEntries(workingItems, states);
+  const groups = buildGroups(visibleEntries);
+  const exactEntry = visibleEntries.length === 1 ? visibleEntries[0] : undefined;
+  const exactResult = Boolean(exactEntry?.match.exactId);
+
+  document.querySelectorAll<HTMLElement>('[data-search-count]').forEach((element) => {
+    element.textContent = String(visibleEntries.length);
+  });
+  document.querySelectorAll<HTMLElement>('[data-search-noun]').forEach((element) => {
+    element.textContent = visibleEntries.length === 1 ? 'result' : 'results';
+  });
+
+  const clearButton = document.querySelector<HTMLButtonElement>('.search-clear');
+  if (clearButton) clearButton.hidden = !queryText;
+
+  const controls = document.querySelector<HTMLElement>('.sticky-controls');
+  controls?.classList.toggle('has-exact-result', exactResult);
+
+  const exactRegion = document.querySelector<HTMLElement>('#exact-match-region');
+  if (exactRegion) exactRegion.innerHTML = exactResult && exactEntry ? renderExactMatchCallout(exactEntry) : '';
+
+  const resultRegion = document.querySelector<HTMLElement>('#inventory-results');
+  if (resultRegion) {
+    resultRegion.innerHTML = `${groups.map((group) => renderGroup(group)).join('')}${visibleEntries.length === 0 ? renderEmptyState() : ''}`;
+  }
+
+  syncMobileLookupLayout();
+}
+
+function pinMobileSearchToTop(): void {
+  if (!window.matchMedia('(max-width: 700px)').matches) return;
+  const controls = document.querySelector<HTMLElement>('.sticky-controls');
+  if (!controls) return;
+  const stickyTop = Number.parseFloat(window.getComputedStyle(controls).top) || 0;
+  const rect = controls.getBoundingClientRect();
+  if (rect.top > stickyTop + 6) {
+    window.scrollBy({ top: rect.top - stickyTop - 6, left: 0, behavior: 'auto' });
+  }
+  syncMobileLookupLayout();
 }
 
 function renderSetupGate(): string {
@@ -597,59 +736,69 @@ function renderWorkMode(
     ${mode === 'planning' ? renderPlanningNotice() + renderBulkTools(workingItems) : ''}
 
     <section class="controls sticky-controls ${exactResult ? 'has-exact-result' : ''}">
-      <div class="search-heading">
-        <div><p class="eyebrow">Fast lookup</p><h2>${mode === 'live' ? 'Find it, call the room, check it in' : 'Find and route inventory'}</h2></div>
-        ${mode === 'live' ? `<button class="emergency-add-inline" data-action="open-emergency-modal">${icon('add')}<span>Unexpected item</span></button>` : ''}
+      <div class="lookup-intro">
+        <div class="search-heading">
+          <div><p class="eyebrow">Fast lookup</p><h2>${mode === 'live' ? 'Find it, call the room, check it in' : 'Find and route inventory'}</h2></div>
+          ${mode === 'live' ? `<button class="emergency-add-inline" data-action="open-emergency-modal">${icon('add')}<span>Unexpected item</span></button>` : ''}
+        </div>
       </div>
       <label class="search-box enhanced-search">
         ${icon('search')}
         <span class="sr-only">Search inventory</span>
         <input id="search-input" type="search" value="${escapeHtml(queryText)}" placeholder="2 = Item 2 · piano · pack:3.1 · 1-40" autocomplete="off" inputmode="search" enterkeyhint="search" />
-        ${queryText ? `<button type="button" class="search-clear" data-action="clear-search" aria-label="Clear search">×</button>` : ''}
+        <button type="button" class="search-clear" data-action="clear-search" aria-label="Clear search" ${queryText ? '' : 'hidden'}>×</button>
       </label>
-      <div class="search-meta">
-        <span><strong>${visibleEntries.length}</strong> result${visibleEntries.length === 1 ? '' : 's'}</span>
-        <span>Exact number search · ranges · descriptions · comments · package types</span>
+      <div class="mobile-lookup-toolbar">
+        <span class="mobile-result-count"><strong data-search-count>${visibleEntries.length}</strong> <span data-search-noun>result${visibleEntries.length === 1 ? '' : 's'}</span></span>
+        <button type="button" class="mobile-lookup-toggle" data-action="toggle-mobile-lookup" aria-expanded="${mobileLookupExpanded ? 'true' : 'false'}">
+          ${icon('filter')}<span class="mobile-lookup-toggle-label">${mobileLookupExpanded ? 'Hide views & filters' : 'Views & filters'}</span><span class="mobile-lookup-chevron" aria-hidden="true">${mobileLookupExpanded ? '▲' : '▼'}</span>
+        </button>
       </div>
-
-      <div class="view-preset-row" aria-label="Quick inventory views">
-        ${viewPresetButton('number', 'list', 'Number list', groupBy === 'none' && filter !== 'received')}
-        ${viewPresetButton('original-room', 'original-room', 'Original rooms', groupBy === 'room' && filter !== 'received')}
-        ${viewPresetButton('destination', 'destination', 'New rooms', groupBy === 'destination' && filter !== 'received')}
-        ${viewPresetButton('checked', 'history', 'Checked off', filter === 'received')}
-      </div>
-
-      <div class="quick-filter-row" aria-label="Quick status filters">
-        ${filterButton('all', 'All')}
-        ${filterButton('remaining', 'Remaining')}
-        ${filterButton('received', 'Received')}
-        ${filterButton('issues', 'Issues')}
-        ${filterButton('no-destination', 'Unrouted')}
-        ${filterButton('high-value', 'High value')}
-        ${filterButton('extra', 'Extras')}
-      </div>
-
-      <details class="advanced-filters" ${activeFilterCount ? 'open' : ''}>
-        <summary>${icon('filter')}<span>Filters, grouping, and sorting</span>${activeFilterCount ? `<b>${activeFilterCount}</b>` : ''}</summary>
-        <div class="filter-grid">
-          <label><span>Original room</span><select id="filter-room">${selectOptions(['ALL', ...getOriginalRooms(workingItems)], filters.originalRoom, 'All original rooms')}</select></label>
-          <label><span>Package type</span><select id="filter-pack">${selectOptions(['ALL', ...getPackTypes(workingItems)], filters.packType, 'All package types')}</select></label>
-          <label><span>Destination</span><select id="filter-destination">${selectOptions(['ALL', ...getDestinations(workingItems, states)], filters.destination, 'All destinations')}</select></label>
-          ${crateFeaturesEnabled() ? `<label><span>Current crate</span><select id="filter-crate">${selectOptions(['ALL', 'UNASSIGNED', ...physicalCrates.map((crate) => crate.crateId)], filters.crate, 'All current crates', crateOptionLabel)}</select></label>` : ''}
-          <label><span>Group by</span><select id="group-select">${groupSelectOptions()}</select></label>
-          <label><span>Sort</span><select id="sort-select">${sortSelectOptions()}</select></label>
-          <div class="range-filter full-width">
-            <label><span>Item number from</span><input id="filter-range-from" type="number" inputmode="numeric" min="1" max="388" value="${escapeHtml(filters.rangeFrom)}" placeholder="1" /></label>
-            <label><span>Item number through</span><input id="filter-range-to" type="number" inputmode="numeric" min="1" max="388" value="${escapeHtml(filters.rangeTo)}" placeholder="388" /></label>
-          </div>
-          <button class="secondary-button full-width" data-action="clear-filters">Clear all filters and sorting</button>
+      <div class="lookup-options">
+        <div class="search-meta">
+          <span><strong data-search-count>${visibleEntries.length}</strong> <span data-search-noun>result${visibleEntries.length === 1 ? '' : 's'}</span></span>
+          <span>Exact number search · ranges · descriptions · comments · package types</span>
         </div>
-      </details>
+
+        <div class="view-preset-row" aria-label="Quick inventory views">
+          ${viewPresetButton('number', 'list', 'Number list', groupBy === 'none' && filter !== 'received')}
+          ${viewPresetButton('original-room', 'original-room', 'Original rooms', groupBy === 'room' && filter !== 'received')}
+          ${viewPresetButton('destination', 'destination', 'New rooms', groupBy === 'destination' && filter !== 'received')}
+          ${viewPresetButton('checked', 'history', 'Checked off', filter === 'received')}
+        </div>
+
+        <div class="quick-filter-row" aria-label="Quick status filters">
+          ${filterButton('all', 'All')}
+          ${filterButton('remaining', 'Remaining')}
+          ${filterButton('received', 'Received')}
+          ${filterButton('issues', 'Issues')}
+          ${filterButton('no-destination', 'Unrouted')}
+          ${filterButton('high-value', 'High value')}
+          ${filterButton('extra', 'Extras')}
+        </div>
+
+        <details class="advanced-filters" ${activeFilterCount ? 'open' : ''}>
+          <summary>${icon('filter')}<span>Filters, grouping, and sorting</span>${activeFilterCount ? `<b>${activeFilterCount}</b>` : ''}</summary>
+          <div class="filter-grid">
+            <label><span>Original room</span><select id="filter-room">${selectOptions(['ALL', ...getOriginalRooms(workingItems)], filters.originalRoom, 'All original rooms')}</select></label>
+            <label><span>Package type</span><select id="filter-pack">${selectOptions(['ALL', ...getPackTypes(workingItems)], filters.packType, 'All package types')}</select></label>
+            <label><span>Destination</span><select id="filter-destination">${selectOptions(['ALL', ...getDestinations(workingItems, states)], filters.destination, 'All destinations')}</select></label>
+            ${crateFeaturesEnabled() ? `<label><span>Current crate</span><select id="filter-crate">${selectOptions(['ALL', 'UNASSIGNED', ...physicalCrates.map((crate) => crate.crateId)], filters.crate, 'All current crates', crateOptionLabel)}</select></label>` : ''}
+            <label><span>Group by</span><select id="group-select">${groupSelectOptions()}</select></label>
+            <label><span>Sort</span><select id="sort-select">${sortSelectOptions()}</select></label>
+            <div class="range-filter full-width">
+              <label><span>Item number from</span><input id="filter-range-from" type="number" inputmode="numeric" min="1" max="388" value="${escapeHtml(filters.rangeFrom)}" placeholder="1" /></label>
+              <label><span>Item number through</span><input id="filter-range-to" type="number" inputmode="numeric" min="1" max="388" value="${escapeHtml(filters.rangeTo)}" placeholder="388" /></label>
+            </div>
+            <button class="secondary-button full-width" data-action="clear-filters">Clear all filters and sorting</button>
+          </div>
+        </details>
+      </div>
     </section>
 
-    ${exactResult && exactEntry ? renderExactMatchCallout(exactEntry) : ''}
+    <div id="exact-match-region">${exactResult && exactEntry ? renderExactMatchCallout(exactEntry) : ''}</div>
 
-    <section class="crate-list">
+    <section class="crate-list" id="inventory-results">
       ${groups.map((group) => renderGroup(group)).join('')}
       ${visibleEntries.length === 0 ? renderEmptyState() : ''}
     </section>
@@ -1006,6 +1155,7 @@ function attachGlobalHandlers(): void {
     const itemId = button.dataset.itemId;
 
     if (action === 'set-mode') {
+      mobileLookupExpanded = false;
       mode = button.dataset.mode as Mode;
       if (mode === 'live' && filter === 'all' && !queryText) filter = 'remaining';
       if (mode === 'planning' && filter === 'remaining') filter = 'all';
@@ -1013,11 +1163,13 @@ function attachGlobalHandlers(): void {
       return;
     }
     if (action === 'set-view') {
+      mobileLookupExpanded = false;
       applyViewPreset(button.dataset.view ?? 'number');
       render();
       return;
     }
     if (action === 'set-filter') {
+      mobileLookupExpanded = false;
       filter = button.dataset.filter as StatusFilter;
       if (filter === 'received') {
         groupBy = 'none';
@@ -1026,10 +1178,18 @@ function attachGlobalHandlers(): void {
       render();
       return;
     }
+    if (action === 'toggle-mobile-lookup') {
+      mobileLookupExpanded = !mobileLookupExpanded;
+      syncMobileLookupLayout();
+      return;
+    }
     if (action === 'clear-search') {
       queryText = '';
-      render();
-      requestAnimationFrame(() => document.querySelector<HTMLInputElement>('#search-input')?.focus());
+      mobileLookupExpanded = false;
+      const searchInput = document.querySelector<HTMLInputElement>('#search-input');
+      if (searchInput) searchInput.value = '';
+      refreshSearchResults();
+      requestAnimationFrame(() => searchInput?.focus());
       return;
     }
     if (action === 'clear-filters') {
@@ -1175,16 +1335,13 @@ function attachGlobalHandlers(): void {
   appRoot.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
     if (input.id === 'search-input') {
+      const wasEmpty = !queryText.trim();
       queryText = input.value;
+      mobileLookupExpanded = false;
+      if (wasEmpty && queryText.trim()) window.requestAnimationFrame(pinMobileSearchToTop);
       window.clearTimeout(searchTimer);
-      searchTimer = window.setTimeout(() => {
-        render();
-        requestAnimationFrame(() => {
-          const replacement = document.querySelector<HTMLInputElement>('#search-input');
-          replacement?.focus();
-          replacement?.setSelectionRange(queryText.length, queryText.length);
-        });
-      }, 80);
+      searchTimer = window.setTimeout(refreshSearchResults, 120);
+      syncMobileLookupLayout();
       return;
     }
 
@@ -1196,6 +1353,23 @@ function attachGlobalHandlers(): void {
       filters.rangeTo = input.value;
       renderPreservingFocus(input.id);
     }
+  });
+
+  appRoot.addEventListener('focusin', (event) => {
+    const input = event.target as HTMLInputElement;
+    if (input.id !== 'search-input') return;
+    mobileLookupExpanded = false;
+    syncMobileLookupLayout();
+  });
+
+  appRoot.addEventListener('focusout', (event) => {
+    const input = event.target as HTMLInputElement;
+    if (input.id !== 'search-input' || !deferredFullRender) return;
+    window.setTimeout(() => {
+      if (document.activeElement?.id === 'search-input') return;
+      deferredFullRender = false;
+      renderPreservingScroll();
+    }, 180);
   });
 
   appRoot.addEventListener('change', (event) => {
