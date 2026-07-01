@@ -130,6 +130,8 @@ let bulkPlannerLabel = '';
 let bulkPlannerBusy = false;
 let bulkSyncInProgress = false;
 let bulkSyncRenderQueued = false;
+let bulkPlannerDeferredRender = false;
+let bulkPlannerStatusMessage = '';
 let toastMessage = '';
 let toastTimer: number | undefined;
 let cloudStatus: FirebaseRuntimeStatus = {
@@ -158,7 +160,7 @@ const sync = new FirebaseSync({
     setInventory(secureInventory);
     await putCachedInventory(secureInventory);
     inventoryCached = true;
-    render();
+    renderOrRefreshDuringSearch();
   },
   onAuthorizedUser: async (user) => {
     meta = {
@@ -167,7 +169,7 @@ const sync = new FirebaseSync({
       lastAuthorizedUsername: user.username
     };
     await putMeta(meta);
-    render();
+    renderOrRefreshDuringSearch();
   },
   onStatus: (status) => {
     cloudStatus = status;
@@ -201,16 +203,16 @@ async function initialize(): Promise<void> {
     immediate: true,
     onNeedRefresh() {
       updateAvailable = true;
-      render();
+      renderOrRefreshDuringSearch();
     },
     onOfflineReady() {
       serviceWorkerReady = true;
-      render();
+      renderOrRefreshDuringSearch();
     },
     onRegisteredSW() {
       void navigator.serviceWorker.ready.then(() => {
         serviceWorkerReady = true;
-        render();
+        renderOrRefreshDuringSearch();
       });
     },
     onRegisterError(error: unknown) {
@@ -221,17 +223,17 @@ async function initialize(): Promise<void> {
   if ('serviceWorker' in navigator) {
     void navigator.serviceWorker.ready.then(() => {
       serviceWorkerReady = true;
-      render();
+      renderOrRefreshDuringSearch();
     });
   }
 
   window.addEventListener('beforeinstallprompt', (event) => {
     event.preventDefault();
     installPrompt = event as BeforeInstallPromptEvent;
-    render();
+    renderOrRefreshDuringSearch();
   });
-  window.addEventListener('online', render);
-  window.addEventListener('offline', render);
+  window.addEventListener('online', renderOrRefreshDuringSearch);
+  window.addEventListener('offline', renderOrRefreshDuringSearch);
   window.addEventListener('resize', scheduleLookupObserver);
   window.addEventListener('orientationchange', scheduleLookupObserver);
 
@@ -241,6 +243,15 @@ async function initialize(): Promise<void> {
 }
 
 function render(): void {
+  performRender();
+}
+
+function forceRender(): void {
+  bulkPlannerDeferredRender = false;
+  performRender();
+}
+
+function performRender(): void {
   if (!cloudStatus.enabled) {
     appRoot.innerHTML = renderSetupGate();
     clearFloatingLookupLayout();
@@ -461,7 +472,17 @@ function clearFloatingLookupLayout(): void {
   document.querySelector<HTMLElement>('#floating-lookup-host')?.replaceChildren();
 }
 
+function shouldDeferRenderForFastPlanner(): boolean {
+  return bulkPlannerOpen && mode === 'planning';
+}
+
 function renderOrRefreshDuringSearch(): void {
+  if (shouldDeferRenderForFastPlanner()) {
+    bulkPlannerDeferredRender = true;
+    syncBulkPlannerControls();
+    syncToastDom();
+    return;
+  }
   if (isSearchInput(document.activeElement) && mode !== 'readiness') {
     deferredFullRender = true;
     refreshSearchResults();
@@ -472,13 +493,13 @@ function renderOrRefreshDuringSearch(): void {
 
 function renderPreservingScroll(): void {
   const scrollY = window.scrollY;
-  render();
+  forceRender();
   window.requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'auto' }));
 }
 
 function renderPreservingElementPosition(selector: string): void {
   const before = document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().top;
-  render();
+  forceRender();
   if (before === undefined) return;
   window.requestAnimationFrame(() => {
     const after = document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().top;
@@ -993,7 +1014,8 @@ function renderGroup(group: ItemGroup): string {
       <div class="crate-items">
         ${group.entries.map((entry) => renderItem(entry)).join('')}
       </div>
-    </details>`;
+      </div>
+    </section>`;
 }
 
 function renderItem(entry: VisibleItem): string {
@@ -1143,8 +1165,12 @@ function renderBulkTools(items: InventoryItem[]): string {
   if (selectedRoom !== bulkPlannerSelectedRoom) bulkPlannerSelectedRoom = selectedRoom;
   const buttonLabel = bulkPlannerBusy ? 'Saving room assignment…' : 'Apply to every piece in this old room';
   return `
-    <details class="bulk-panel" ${bulkPlannerOpen ? 'open' : ''}>
-      <summary>${icon('room')} Fast planning tools</summary>
+    <section class="bulk-panel ${bulkPlannerOpen ? 'is-open' : ''}" data-bulk-panel>
+      <button type="button" class="bulk-panel-toggle" data-action="toggle-bulk-planner" aria-expanded="${bulkPlannerOpen ? 'true' : 'false'}">
+        <span class="bulk-panel-toggle-title">${icon('room')} Fast planning tools</span>
+        <span class="bulk-panel-toggle-state" aria-hidden="true">${bulkPlannerOpen ? '−' : '+'}</span>
+      </button>
+      <div class="bulk-panel-body" ${bulkPlannerOpen ? '' : 'hidden'}>
       <div class="bulk-grid">
         <section>
           <h3>Route an entire old room</h3>
@@ -1160,7 +1186,7 @@ function renderBulkTools(items: InventoryItem[]): string {
             <label><span>New destination label</span><input id="bulk-label" value="${escapeHtml(bulkPlannerLabel)}" placeholder="Room A" ${bulkPlannerKeepOriginal || bulkPlannerBusy ? 'disabled' : ''} /></label>
           </div>
           <button class="primary-button bulk-route-button ${bulkPlannerBusy ? 'is-busy' : ''}" data-action="bulk-route-room" ${bulkPlannerBusy ? 'disabled aria-busy="true"' : ''}>${icon(bulkPlannerBusy ? 'progress' : 'route')} ${buttonLabel}</button>
-          <p class="bulk-save-note" aria-live="polite">The planner stays open while room events sync, so you can continue directly to the next room.</p>
+          <p id="bulk-save-note" class="bulk-save-note" aria-live="polite">${escapeHtml(bulkPlannerStatusMessage || 'The planner stays open while room events sync, so you can continue directly to the next room.')}</p>
         </section>
         ${crateFeaturesEnabled() ? `<section>
           <h3>Assign a documented item range to a crate</h3>
@@ -1173,7 +1199,8 @@ function renderBulkTools(items: InventoryItem[]): string {
           <button class="primary-button" data-action="bulk-assign-crate">Assign range to crate</button>
         </section>` : ''}
       </div>
-    </details>`;
+      </div>
+    </section>`;
 }
 
 function renderReadiness(counts: CountSummary, workingItems: InventoryItem[]): string {
@@ -1310,6 +1337,16 @@ function attachGlobalHandlers(): void {
       render();
     }
     if (action === 'save-plan' && itemId) await savePlan(itemId);
+    if (action === 'toggle-bulk-planner') {
+      bulkPlannerOpen = !bulkPlannerOpen;
+      if (!bulkPlannerOpen && bulkPlannerDeferredRender) {
+        bulkPlannerDeferredRender = false;
+        renderPreservingElementPosition('[data-bulk-panel]');
+      } else {
+        syncBulkPlannerDisclosure();
+      }
+      return;
+    }
     if (action === 'bulk-route-room') await bulkRouteRoom();
     if (action === 'bulk-assign-crate') await bulkAssignCrate();
     if (action === 'open-emergency-modal') {
@@ -1389,12 +1426,6 @@ function attachGlobalHandlers(): void {
     if (action === 'print-checklist') printDayOfChecklist();
   });
 
-  appRoot.addEventListener('toggle', (event) => {
-    const details = event.target as HTMLDetailsElement;
-    if (!details.matches('.bulk-panel')) return;
-    bulkPlannerOpen = details.open;
-  }, true);
-
   appRoot.addEventListener('submit', async (event) => {
     const form = event.target as HTMLFormElement;
     if (form.id === 'login-form') {
@@ -1455,6 +1486,7 @@ function attachGlobalHandlers(): void {
       renderPreservingFocus(input.id);
     }
   });
+
 
   appRoot.addEventListener('focusin', (event) => {
     const input = event.target as HTMLInputElement;
@@ -1654,6 +1686,41 @@ function toggleBulkDestinationInputs(keepOriginal: boolean): void {
   });
 }
 
+function syncBulkPlannerDisclosure(): void {
+  const panel = document.querySelector<HTMLElement>('[data-bulk-panel]');
+  const body = panel?.querySelector<HTMLElement>('.bulk-panel-body');
+  const toggle = panel?.querySelector<HTMLButtonElement>('[data-action="toggle-bulk-planner"]');
+  const state = panel?.querySelector<HTMLElement>('.bulk-panel-toggle-state');
+  panel?.classList.toggle('is-open', bulkPlannerOpen);
+  if (body) body.hidden = !bulkPlannerOpen;
+  toggle?.setAttribute('aria-expanded', String(bulkPlannerOpen));
+  if (state) state.textContent = bulkPlannerOpen ? '−' : '+';
+}
+
+function syncBulkPlannerControls(): void {
+  syncBulkPlannerDisclosure();
+  const panel = document.querySelector<HTMLElement>('[data-bulk-panel]');
+  const room = panel?.querySelector<HTMLSelectElement>('#bulk-room');
+  const keep = panel?.querySelector<HTMLInputElement>('#bulk-keep-original');
+  const code = panel?.querySelector<HTMLInputElement>('#bulk-code');
+  const label = panel?.querySelector<HTMLInputElement>('#bulk-label');
+  const button = panel?.querySelector<HTMLButtonElement>('[data-action="bulk-route-room"]');
+  const note = panel?.querySelector<HTMLElement>('#bulk-save-note');
+
+  if (room) room.disabled = bulkPlannerBusy;
+  if (keep) keep.disabled = bulkPlannerBusy;
+  if (code) code.disabled = bulkPlannerBusy || bulkPlannerKeepOriginal;
+  if (label) label.disabled = bulkPlannerBusy || bulkPlannerKeepOriginal;
+  if (button) {
+    button.disabled = bulkPlannerBusy;
+    button.classList.toggle('is-busy', bulkPlannerBusy);
+    button.setAttribute('aria-busy', String(bulkPlannerBusy));
+    button.innerHTML = `${icon(bulkPlannerBusy ? 'progress' : 'route')} ${bulkPlannerBusy ? 'Saving room assignment…' : 'Apply to every piece in this old room'}`;
+  }
+  if (note) note.textContent = bulkPlannerStatusMessage || 'The planner stays open while room events sync, so you can continue directly to the next room.';
+  toggleBulkDestinationInputs(bulkPlannerKeepOriginal);
+}
+
 async function saveSharedMoveSettings(): Promise<void> {
   destinationDraft = readDestinationDraftFromDom();
   const hasCrateListing = document.querySelector<HTMLInputElement>('#shared-crate-listing')?.checked ?? false;
@@ -1668,7 +1735,7 @@ function renderPreservingFocus(id: string): void {
   const sourceId = current?.dataset.sourceId;
   const value = current?.value ?? '';
   const selection = current?.selectionStart ?? value.length;
-  render();
+  forceRender();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       const replacement =
@@ -1837,7 +1904,8 @@ async function bulkRouteRoom(): Promise<void> {
   if (!window.confirm(`${destinationDescription} for all ${targets.length} pieces originally listed in ${originalRoom}?`)) return;
 
   bulkPlannerBusy = true;
-  renderPreservingElementPosition('.bulk-panel');
+  bulkPlannerStatusMessage = `Saving ${targets.length} piece${targets.length === 1 ? '' : 's'} from ${originalRoom}…`;
+  syncBulkPlannerControls();
 
   const newEvents = targets.map((item, index) => {
     const state = deriveItemState(item.itemId, events);
@@ -1891,13 +1959,10 @@ async function saveBulkEvents(newEvents: MoveEvent[], confirmation: string): Pro
   try {
     await putEvents(newEvents);
     events = await getAllEvents();
-    toastMessage = confirmation;
-    window.clearTimeout(toastTimer);
-    toastTimer = window.setTimeout(() => {
-      toastMessage = '';
-      renderPreservingElementPosition('.bulk-panel');
-    }, 3200);
-    renderPreservingElementPosition('.bulk-panel');
+    bulkPlannerDeferredRender = true;
+    bulkPlannerStatusMessage = confirmation;
+    syncBulkPlannerControls();
+    showToast(confirmation);
     try {
       await sync.flushLocalEvents();
     } catch (error) {
@@ -1909,8 +1974,11 @@ async function saveBulkEvents(newEvents: MoveEvent[], confirmation: string): Pro
     bulkPlannerBusy = false;
     if (bulkSyncRenderQueued) events = await getAllEvents();
     bulkSyncRenderQueued = false;
-    if (syncQueuedOffline) toastMessage = `${confirmation} Saved locally; cloud sync will retry automatically.`;
-    renderPreservingElementPosition('.bulk-panel');
+    if (syncQueuedOffline) {
+      bulkPlannerStatusMessage = `${confirmation} Saved locally; cloud sync will retry automatically.`;
+      showToast(bulkPlannerStatusMessage);
+    }
+    syncBulkPlannerControls();
   }
 }
 
@@ -2258,12 +2326,23 @@ function sortSelectOptions(): string {
 
 function showToast(message: string): void {
   toastMessage = message;
+  syncToastDom();
   window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => {
     toastMessage = '';
-    render();
+    syncToastDom();
   }, 2600);
-  render();
+}
+
+function syncToastDom(): void {
+  const existing = document.querySelector<HTMLElement>('.success-toast');
+  if (!toastMessage) {
+    existing?.remove();
+    return;
+  }
+  const markup = `<div class="success-toast" role="status" aria-live="polite">${icon('check')}<span>${escapeHtml(toastMessage)}</span></div>`;
+  if (existing) existing.outerHTML = markup;
+  else appRoot.insertAdjacentHTML('beforeend', markup);
 }
 
 function readinessCheck(label: string, ready: boolean, detail: string): string {

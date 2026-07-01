@@ -1,7 +1,7 @@
 {
   "name": "move-command-center",
   "private": true,
-  "version": "0.6.4",
+  "version": "0.6.5",
   "type": "module",
   "engines": {
     "node": ">=22.12.0"
@@ -14,7 +14,7 @@
     "preview": "vite preview --host 0.0.0.0",
     "package": "npm run validate:private && npm run build && node scripts/package-release.mjs",
     "validate:security": "node scripts/validate-security-config.mjs",
-    "validate:upgrade": "node scripts/validate-v064-fast-planning.mjs"
+    "validate:upgrade": "node scripts/validate-v065-fast-planning.mjs"
   },
   "dependencies": {
     "firebase": "12.15.0"
