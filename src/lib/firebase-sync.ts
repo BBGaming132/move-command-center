@@ -29,14 +29,18 @@ import type {
   AuthenticatedMoveUser,
   FirebaseRuntimeStatus,
   InventoryBundle,
-  MoveEvent
+  MoveEvent,
+  RoomOption,
+  SharedDestinationCatalogSnapshot
 } from '../types';
 import { getAllEvents, putEvents } from './db';
+import { getEventsRevision, getInventoryRevision, sameRuntimeStatus } from './sync-stability';
 
 interface SyncCallbacks {
   onEvents: (events: MoveEvent[]) => void | Promise<void>;
   onInventory: (inventory: InventoryBundle) => void | Promise<void>;
   onAuthorizedUser: (user: AuthenticatedMoveUser) => void | Promise<void>;
+  onDestinationCatalog: (snapshot: SharedDestinationCatalogSnapshot) => void | Promise<void>;
   onStatus: (status: FirebaseRuntimeStatus) => void;
 }
 
@@ -59,6 +63,16 @@ export class FirebaseSync {
   private unsubscribeMember: Unsubscribe | undefined;
   private unsubscribeInventory: Unsubscribe | undefined;
   private unsubscribeEvents: Unsubscribe | undefined;
+  private unsubscribeDestinations: Unsubscribe | undefined;
+  private cloudEventIds = new Set<string>();
+  private eventSnapshotReady = false;
+  private flushInProgress = false;
+  private flushRequested = false;
+  private eventDeliveryTimer: number | undefined;
+  private lastDeliveredEventRevision = '';
+  private lastInventoryRevision = '';
+  private lastAuthorizedRevision = '';
+  private lastDestinationCatalogRevision = '';
 
   constructor(callbacks: SyncCallbacks) {
     this.callbacks = callbacks;
@@ -195,17 +209,66 @@ export class FirebaseSync {
 
   async flushLocalEvents(): Promise<void> {
     if (!this.db || !this.status.authorized || !this.currentUser) return;
-    const events = await getAllEvents();
-    const preparedEvents = events.map((event) => this.prepareEvent(event));
-    await putEvents(preparedEvents);
-    for (const event of preparedEvents) {
-      try {
-        await setDoc(doc(this.db, 'moves', moveConfig.moveId, 'events', event.id), event);
-      } catch (error) {
-        this.patchStatus({ lastError: error instanceof Error ? error.message : String(error) });
-        return;
+    if (!this.eventSnapshotReady) {
+      this.flushRequested = true;
+      return;
+    }
+    if (this.flushInProgress) {
+      this.flushRequested = true;
+      return;
+    }
+
+    this.flushInProgress = true;
+    this.flushRequested = false;
+    try {
+      const events = await getAllEvents();
+      // The UI already rendered these durable local events. Mark this revision as
+      // delivered before upload so acknowledgements cannot trigger a redraw storm.
+      this.lastDeliveredEventRevision = getEventsRevision(events);
+      const missingEvents = events.filter((event) => !this.cloudEventIds.has(event.id));
+      if (!missingEvents.length) return;
+
+      const preparedEvents = missingEvents.map((event) => this.prepareEvent(event));
+      await putEvents(preparedEvents);
+      for (const event of preparedEvents) {
+        try {
+          await setDoc(doc(this.db, 'moves', moveConfig.moveId, 'events', event.id), event);
+          this.cloudEventIds.add(event.id);
+        } catch (error) {
+          this.patchStatus({ lastError: error instanceof Error ? error.message : String(error) });
+          return;
+        }
+      }
+    } finally {
+      this.flushInProgress = false;
+      if (this.flushRequested) {
+        this.flushRequested = false;
+        window.setTimeout(() => void this.flushLocalEvents(), 0);
       }
     }
+  }
+
+  async saveDestinationCatalog(catalog: RoomOption[]): Promise<void> {
+    if (!this.db || !this.status.authorized || !this.currentUser) {
+      throw new Error('The shared destination list cannot sync until this device is authorized.');
+    }
+    const snapshot: SharedDestinationCatalogSnapshot = {
+      catalog: catalog.map((room) => ({
+        code: room.code.trim().toUpperCase(),
+        label: room.label.trim(),
+        directions: room.directions?.trim() || undefined,
+        active: room.active !== false
+      })),
+      updatedAt: Date.now(),
+      updatedByUid: this.currentUser.uid,
+      updatedByUsername: this.currentUser.username
+    };
+    await setDoc(doc(this.db, 'moves', moveConfig.moveId, 'shared', 'destinations'), {
+      catalogJson: JSON.stringify(snapshot.catalog),
+      updatedAt: snapshot.updatedAt,
+      updatedByUid: snapshot.updatedByUid,
+      updatedByUsername: snapshot.updatedByUsername
+    });
   }
 
   getStatus(): FirebaseRuntimeStatus {
@@ -221,7 +284,6 @@ export class FirebaseSync {
     const memberRef = doc(this.db, 'moves', moveConfig.moveId, 'members', user.uid);
     this.unsubscribeMember = onSnapshot(
       memberRef,
-      { includeMetadataChanges: true },
       (snapshot) => {
         const data = snapshot.data() as { active?: boolean; username?: string; displayName?: string } | undefined;
         if (!snapshot.exists() || data?.active !== true) {
@@ -240,7 +302,11 @@ export class FirebaseSync {
         };
         this.currentUser = authorizedUser;
         this.patchStatus({ authorized: true, user: authorizedUser, lastError: undefined });
-        void this.callbacks.onAuthorizedUser(authorizedUser);
+        const authorizedRevision = `${authorizedUser.uid}|${authorizedUser.username}|${authorizedUser.displayName ?? ''}`;
+        if (authorizedRevision !== this.lastAuthorizedRevision) {
+          this.lastAuthorizedRevision = authorizedRevision;
+          void this.callbacks.onAuthorizedUser(authorizedUser);
+        }
         this.startDataListeners(authorizedUser.uid);
       },
       (error) => {
@@ -262,7 +328,6 @@ export class FirebaseSync {
     const inventoryRef = doc(this.db, 'moves', moveConfig.moveId, 'private', 'inventory');
     this.unsubscribeInventory = onSnapshot(
       inventoryRef,
-      { includeMetadataChanges: true },
       async (snapshot) => {
         if (!snapshot.exists()) {
           this.patchStatus({
@@ -272,8 +337,53 @@ export class FirebaseSync {
           return;
         }
         const secureInventory = snapshot.data() as InventoryBundle;
-        await this.callbacks.onInventory(secureInventory);
+        const revision = getInventoryRevision(secureInventory);
+        if (revision !== this.lastInventoryRevision) {
+          this.lastInventoryRevision = revision;
+          await this.callbacks.onInventory(secureInventory);
+        }
         this.patchStatus({ inventoryLoaded: true, connected: navigator.onLine, lastError: undefined });
+      },
+      (error) => this.patchStatus({ lastError: error.message })
+    );
+
+    const destinationsRef = doc(this.db, 'moves', moveConfig.moveId, 'shared', 'destinations');
+    this.unsubscribeDestinations = onSnapshot(
+      destinationsRef,
+      async (snapshot) => {
+        if (!snapshot.exists()) return;
+        const data = snapshot.data() as {
+          catalogJson?: string;
+          updatedAt?: number;
+          updatedByUid?: string;
+          updatedByUsername?: string;
+        };
+        if (!data.catalogJson) return;
+        let catalog: RoomOption[];
+        try {
+          const parsed = JSON.parse(data.catalogJson) as unknown;
+          if (!Array.isArray(parsed)) return;
+          catalog = parsed
+            .filter((entry): entry is RoomOption => Boolean(entry && typeof entry === 'object'))
+            .map((entry) => ({
+              code: String(entry.code ?? '').trim().toUpperCase(),
+              label: String(entry.label ?? '').trim(),
+              directions: entry.directions ? String(entry.directions).trim() : undefined,
+              active: entry.active !== false
+            }))
+            .filter((entry) => Boolean(entry.code && entry.label));
+        } catch {
+          return;
+        }
+        const revision = `${data.updatedAt ?? 0}|${data.updatedByUid ?? ''}|${data.catalogJson}`;
+        if (revision === this.lastDestinationCatalogRevision) return;
+        this.lastDestinationCatalogRevision = revision;
+        await this.callbacks.onDestinationCatalog({
+          catalog,
+          updatedAt: Number(data.updatedAt ?? 0),
+          updatedByUid: String(data.updatedByUid ?? ''),
+          updatedByUsername: String(data.updatedByUsername ?? '')
+        });
       },
       (error) => this.patchStatus({ lastError: error.message })
     );
@@ -281,29 +391,54 @@ export class FirebaseSync {
     const eventsQuery = query(collection(this.db, 'moves', moveConfig.moveId, 'events'));
     this.unsubscribeEvents = onSnapshot(
       eventsQuery,
-      { includeMetadataChanges: true },
       async (snapshot) => {
         const cloudEvents = snapshot.docs.map((snapshotDoc) => snapshotDoc.data() as MoveEvent);
+        this.cloudEventIds = new Set(cloudEvents.map((event) => event.id));
         await putEvents(cloudEvents);
-        await this.callbacks.onEvents(cloudEvents);
+        this.scheduleEventDelivery();
+
+        const serverSnapshot = !snapshot.metadata.fromCache;
+        const firstServerSnapshot = serverSnapshot && !this.eventSnapshotReady;
+        if (firstServerSnapshot) this.eventSnapshotReady = true;
         this.patchStatus({
-          snapshotLoaded: this.status.snapshotLoaded || !snapshot.metadata.fromCache,
+          snapshotLoaded: this.status.snapshotLoaded || serverSnapshot,
           connected: navigator.onLine,
           lastError: undefined
         });
+        if (firstServerSnapshot && navigator.onLine) void this.flushLocalEvents();
       },
       (error) => this.patchStatus({ lastError: error.message })
     );
-
-    void this.flushLocalEvents();
   }
 
   private stopDataListeners(): void {
     this.unsubscribeInventory?.();
     this.unsubscribeEvents?.();
+    this.unsubscribeDestinations?.();
     this.unsubscribeInventory = undefined;
     this.unsubscribeEvents = undefined;
+    this.unsubscribeDestinations = undefined;
     this.activeDataUid = undefined;
+    this.cloudEventIds.clear();
+    this.eventSnapshotReady = false;
+    this.flushRequested = false;
+    window.clearTimeout(this.eventDeliveryTimer);
+    this.eventDeliveryTimer = undefined;
+    this.lastDeliveredEventRevision = '';
+    this.lastInventoryRevision = '';
+    this.lastDestinationCatalogRevision = '';
+  }
+
+  private scheduleEventDelivery(): void {
+    window.clearTimeout(this.eventDeliveryTimer);
+    this.eventDeliveryTimer = window.setTimeout(async () => {
+      this.eventDeliveryTimer = undefined;
+      const allEvents = await getAllEvents();
+      const revision = getEventsRevision(allEvents);
+      if (revision === this.lastDeliveredEventRevision) return;
+      this.lastDeliveredEventRevision = revision;
+      await this.callbacks.onEvents(allEvents);
+    }, 180);
   }
 
   private prepareEvent(event: MoveEvent): MoveEvent {
@@ -317,7 +452,9 @@ export class FirebaseSync {
   }
 
   private patchStatus(patch: Partial<FirebaseRuntimeStatus>): void {
-    this.status = { ...this.status, ...patch };
+    const nextStatus = { ...this.status, ...patch };
+    if (sameRuntimeStatus(this.status, nextStatus)) return;
+    this.status = nextStatus;
     this.emitStatus();
   }
 
@@ -325,3 +462,4 @@ export class FirebaseSync {
     this.callbacks.onStatus(this.getStatus());
   }
 }
+

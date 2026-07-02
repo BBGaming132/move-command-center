@@ -9,7 +9,8 @@ import type {
   InventoryBundle,
   InventoryItem,
   MoveEvent,
-  RoomOption
+  RoomOption,
+  SharedDestinationCatalogSnapshot
 } from './types';
 import {
   clearLocalData,
@@ -32,6 +33,8 @@ import {
 } from './lib/events';
 import { evaluateSearch, getGeneratedSearchTags, normalizeForSort, type SearchMatch } from './lib/search';
 import { FirebaseSync } from './lib/firebase-sync';
+import { getCloudUiRevision, getEventsRevision, getInventoryRevision, shouldDeferForInteraction } from './lib/sync-stability';
+import { destinationLabelForCode, destinationOptions, isValidSequentialExtraItemId, nextSequentialExtraItemId, normalizeDestinationCode } from './lib/destination-controls';
 
 const defaultRooms = roomJson as RoomOption[];
 const appRoot = getAppRoot();
@@ -104,6 +107,8 @@ let filters: FilterState = {
   rangeTo: ''
 };
 let events: MoveEvent[] = [];
+let eventsRevision = '';
+let cloudUiRevision = '';
 let meta: AppMeta = { deviceId: crypto.randomUUID(), deviceName: 'Unassigned device' };
 let localDbReady = false;
 let serviceWorkerReady = false;
@@ -117,6 +122,11 @@ let showSettings = false;
 let showEmergencyModal = false;
 let editingEmergencyItemId: string | undefined;
 let destinationDraft: DestinationDraftRow[] | undefined;
+let destinationDraftDirty = false;
+let sharedDestinationCatalog: RoomOption[] | undefined;
+let sharedDestinationCatalogSnapshot: SharedDestinationCatalogSnapshot | undefined;
+let sharedCatalogMigrationAttempted = false;
+const expandedGroupKeys = new Set<string>();
 const animatedReceiptIds = new Set<string>();
 let floatingLookupExpanded = false;
 let floatingLookupVisible = false;
@@ -130,8 +140,6 @@ let bulkPlannerLabel = '';
 let bulkPlannerBusy = false;
 let bulkSyncInProgress = false;
 let bulkSyncRenderQueued = false;
-let bulkPlannerDeferredRender = false;
-let bulkPlannerStatusMessage = '';
 let toastMessage = '';
 let toastTimer: number | undefined;
 let cloudStatus: FirebaseRuntimeStatus = {
@@ -147,37 +155,60 @@ let installPrompt: BeforeInstallPromptEvent | undefined;
 let applyServiceWorkerUpdate: ((reloadPage?: boolean) => Promise<void>) | undefined;
 
 const sync = new FirebaseSync({
-  onEvents: async () => {
-    events = await getAllEvents();
+  onEvents: async (incomingEvents) => {
+    const nextEvents = incomingEvents.length ? incomingEvents : await getAllEvents();
+    const nextRevision = getEventsRevision(nextEvents);
+    if (nextRevision === eventsRevision) return;
+    replaceEvents(nextEvents);
+    void ensureSharedDestinationCatalogMigrated();
     if (bulkSyncInProgress) {
       bulkSyncRenderQueued = true;
       return;
     }
-    renderOrRefreshDuringSearch();
+    renderOrDeferDuringInteraction();
   },
   onInventory: async (secureInventory) => {
     verifyRuntimeInventory(secureInventory);
-    setInventory(secureInventory);
+    const changed = getInventoryRevision(secureInventory) !== getInventoryRevision(inventory);
+    if (changed) setInventory(secureInventory);
     await putCachedInventory(secureInventory);
     inventoryCached = true;
-    renderOrRefreshDuringSearch();
+    if (changed) renderOrDeferDuringInteraction();
   },
   onAuthorizedUser: async (user) => {
+    const changed = meta.lastAuthorizedUid !== user.uid || meta.lastAuthorizedUsername !== user.username;
     meta = {
       ...meta,
       lastAuthorizedUid: user.uid,
       lastAuthorizedUsername: user.username
     };
     await putMeta(meta);
-    renderOrRefreshDuringSearch();
+    if (changed) renderOrDeferDuringInteraction();
+  },
+  onDestinationCatalog: async (snapshot) => {
+    const normalized = sanitizeSharedDestinationCatalog(snapshot.catalog);
+    const revision = JSON.stringify(normalized);
+    const previousRevision = sharedDestinationCatalog ? JSON.stringify(sharedDestinationCatalog) : '';
+    sharedDestinationCatalog = normalized;
+    sharedCatalogMigrationAttempted = true;
+    sharedDestinationCatalogSnapshot = { ...snapshot, catalog: normalized };
+    if (revision === previousRevision) return;
+    if (showSettings && !destinationDraftDirty) {
+      destinationDraft = normalized.map((room) => ({ ...room, originalCode: room.code }));
+    }
+    renderOrDeferDuringInteraction();
   },
   onStatus: (status) => {
+    const nextRevision = getCloudUiRevision(status);
     cloudStatus = status;
+    void ensureSharedDestinationCatalogMigrated();
+    if (nextRevision === cloudUiRevision) return;
+    cloudUiRevision = nextRevision;
     if (bulkSyncInProgress) {
       bulkSyncRenderQueued = true;
       return;
     }
-    renderOrRefreshDuringSearch();
+    renderOrDeferDuringInteraction();
   }
 });
 
@@ -197,22 +228,23 @@ async function initialize(): Promise<void> {
     setInventory(cachedInventory);
     inventoryCached = true;
   }
-  events = await getAllEvents();
+  replaceEvents(await getAllEvents());
+  cloudUiRevision = getCloudUiRevision(cloudStatus);
 
   applyServiceWorkerUpdate = registerSW({
     immediate: true,
     onNeedRefresh() {
       updateAvailable = true;
-      renderOrRefreshDuringSearch();
+      render();
     },
     onOfflineReady() {
       serviceWorkerReady = true;
-      renderOrRefreshDuringSearch();
+      render();
     },
     onRegisteredSW() {
       void navigator.serviceWorker.ready.then(() => {
         serviceWorkerReady = true;
-        renderOrRefreshDuringSearch();
+        render();
       });
     },
     onRegisterError(error: unknown) {
@@ -223,17 +255,17 @@ async function initialize(): Promise<void> {
   if ('serviceWorker' in navigator) {
     void navigator.serviceWorker.ready.then(() => {
       serviceWorkerReady = true;
-      renderOrRefreshDuringSearch();
+      render();
     });
   }
 
   window.addEventListener('beforeinstallprompt', (event) => {
     event.preventDefault();
     installPrompt = event as BeforeInstallPromptEvent;
-    renderOrRefreshDuringSearch();
+    render();
   });
-  window.addEventListener('online', renderOrRefreshDuringSearch);
-  window.addEventListener('offline', renderOrRefreshDuringSearch);
+  window.addEventListener('online', render);
+  window.addEventListener('offline', render);
   window.addEventListener('resize', scheduleLookupObserver);
   window.addEventListener('orientationchange', scheduleLookupObserver);
 
@@ -243,15 +275,6 @@ async function initialize(): Promise<void> {
 }
 
 function render(): void {
-  performRender();
-}
-
-function forceRender(): void {
-  bulkPlannerDeferredRender = false;
-  performRender();
-}
-
-function performRender(): void {
   if (!cloudStatus.enabled) {
     appRoot.innerHTML = renderSetupGate();
     clearFloatingLookupLayout();
@@ -472,34 +495,53 @@ function clearFloatingLookupLayout(): void {
   document.querySelector<HTMLElement>('#floating-lookup-host')?.replaceChildren();
 }
 
-function shouldDeferRenderForFastPlanner(): boolean {
-  return bulkPlannerOpen && mode === 'planning';
-}
-
-function renderOrRefreshDuringSearch(): void {
-  if (shouldDeferRenderForFastPlanner()) {
-    bulkPlannerDeferredRender = true;
-    syncBulkPlannerControls();
-    syncToastDom();
-    return;
-  }
+function renderOrDeferDuringInteraction(): void {
   if (isSearchInput(document.activeElement) && mode !== 'readiness') {
     deferredFullRender = true;
     refreshSearchResults();
     return;
   }
+  if (shouldProtectCurrentInteraction()) {
+    deferredFullRender = true;
+    return;
+  }
+  deferredFullRender = false;
   render();
+}
+
+function shouldProtectCurrentInteraction(): boolean {
+  const active = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+  return shouldDeferForInteraction({
+    mode,
+    bulkPlannerOpen,
+    openBulkPanelPresent: Boolean(document.querySelector('.bulk-panel[open]')),
+    settingsOpen: showSettings,
+    emergencyModalOpen: showEmergencyModal,
+    activeTagName: active?.tagName,
+    activeInsideEditor: Boolean(active?.closest('details[open], .planning-form, [data-modal-panel]'))
+  });
+}
+
+function flushDeferredRender(): void {
+  if (!deferredFullRender || shouldProtectCurrentInteraction()) return;
+  deferredFullRender = false;
+  renderPreservingScroll();
+}
+
+function replaceEvents(nextEvents: MoveEvent[]): void {
+  events = nextEvents;
+  eventsRevision = getEventsRevision(nextEvents);
 }
 
 function renderPreservingScroll(): void {
   const scrollY = window.scrollY;
-  forceRender();
+  render();
   window.requestAnimationFrame(() => window.scrollTo({ top: scrollY, behavior: 'auto' }));
 }
 
 function renderPreservingElementPosition(selector: string): void {
   const before = document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().top;
-  forceRender();
+  render();
   if (before === undefined) return;
   window.requestAnimationFrame(() => {
     const after = document.querySelector<HTMLElement>(selector)?.getBoundingClientRect().top;
@@ -534,6 +576,9 @@ function refreshSearchResults(): void {
 
   const exactRegion = document.querySelector<HTMLElement>('#exact-match-region');
   if (exactRegion) exactRegion.innerHTML = exactResult && exactEntry ? renderExactMatchCallout(exactEntry) : '';
+
+  const toolbarRegion = document.querySelector<HTMLElement>('#group-toolbar-region');
+  if (toolbarRegion) toolbarRegion.innerHTML = renderGroupToolbar(groups);
 
   const resultRegion = document.querySelector<HTMLElement>('#inventory-results');
   if (resultRegion) {
@@ -613,6 +658,8 @@ function renderSettingsModal(): string {
     : 'Using the safe default: crate features hidden';
   const catalog = destinationDraft ?? getDestinationCatalog().map((room) => ({ ...room, originalCode: room.code }));
   const catalogUpdated = latestDestinationCatalogEvent();
+  const sharedCatalogUpdatedAt = sharedDestinationCatalogSnapshot?.updatedAt || catalogUpdated?.clientAt;
+  const sharedCatalogUpdatedBy = sharedDestinationCatalogSnapshot?.updatedByUsername || catalogUpdated?.actorUsername;
   return `
     <div class="modal-backdrop" data-action="close-settings">
       <section class="settings-modal settings-modal-wide" role="dialog" aria-modal="true" aria-label="Device, move, and destination settings" data-modal-panel>
@@ -649,7 +696,7 @@ function renderSettingsModal(): string {
             <label class="remember-row migration-row"><input id="migrate-destination-assignments" type="checkbox" checked /><span>Update pieces already routed with any code or label I rename</span></label>
           </div>
           <button class="primary-button destination-save-button" data-action="save-destination-catalog">${icon('catalog')} Save shared destination list</button>
-          <p class="setting-updated">${catalogUpdated ? `Last saved ${escapeHtml(formatDateTime(catalogUpdated.clientAt))}${catalogUpdated.actorUsername ? ` by @${escapeHtml(catalogUpdated.actorUsername)}` : ''}` : 'Using the built-in destination list until the first save.'}</p>
+          <p class="setting-updated">${sharedCatalogUpdatedAt ? `Last synchronized ${escapeHtml(formatDateTime(sharedCatalogUpdatedAt))}${sharedCatalogUpdatedBy ? ` by @${escapeHtml(sharedCatalogUpdatedBy)}` : ''}` : 'Using the built-in destination list until the first save.'}</p>
         </section>
 
         <label class="settings-field"><span>Rename this device</span><input id="device-name-setting" value="${escapeHtml(meta.deviceName)}" maxlength="80" /></label>
@@ -682,7 +729,13 @@ function renderEmergencyModal(items: InventoryItem[], states: Map<string, Derive
   const description = String(currentDetails?.payload.description ?? editingItem?.sourceFields.Content ?? '');
   const comments = String(currentDetails?.payload.comments ?? editingItem?.sourceFields.Comments ?? '');
   const packType = String(currentDetails?.payload.packType ?? editingItem?.originalCode ?? '');
-  const observedArea = String(currentDetails?.payload.observedArea ?? editingItem?.originalRoom ?? '');
+  const observedArea = String(currentDetails?.payload.observedArea ?? editingItem?.originalRoom ?? (editingItem ? '' : 'Sunroom'));
+  const suggestedItemNumber = editingItem?.itemId ?? nextSequentialExtraItemId(items);
+  const sunroomDestination = getDestinationCatalog().find((room) =>
+    normalizeDestinationCode(room.code) === 'SUNROOM' || normalizeForSort(room.label) === 'sunroom'
+  );
+  const emergencyDestinationCode = state.destinationCode ?? (editingItem ? '' : sunroomDestination?.code ?? 'SUNROOM');
+  const emergencyDestinationLabel = state.destinationLabel ?? (editingItem ? '' : sunroomDestination?.label ?? 'Sunroom');
   const crateId = state.assignedCrateId || editingItem?.crateId || 'UNASSIGNED';
 
   return `
@@ -694,13 +747,13 @@ function renderEmergencyModal(items: InventoryItem[], states: Map<string, Derive
         </div>
         <p class="modal-explainer">Use this only when a physical item arrives but cannot be matched to Inventory Items 1–388.</p>
         <form id="emergency-item-form" class="emergency-form" data-editing-item-id="${escapeHtml(editingItem?.itemId ?? '')}">
+          <label><span>Inventory item number *</span><input id="emergency-item-number" value="${escapeHtml(suggestedItemNumber)}" inputmode="numeric" pattern="[0-9]*" maxlength="6" ${editingItem ? 'readonly aria-readonly="true"' : ''} required /></label>
+          <label><span>Observed area / clue</span><input id="emergency-area" value="${escapeHtml(observedArea)}" placeholder="Sunroom" maxlength="120" /></label>
           <label class="full-width"><span>Item name or description *</span><input id="emergency-description" value="${escapeHtml(description)}" placeholder="Example: loose framed picture" maxlength="300" required autofocus /></label>
           <label class="full-width"><span>Details visible on the item</span><textarea id="emergency-comments" rows="2" maxlength="1000" placeholder="Color, brand, label, damage, serial number…">${escapeHtml(comments)}</textarea></label>
           <label><span>Package type</span><input id="emergency-pack" list="pack-options" value="${escapeHtml(packType)}" placeholder="Loose item, 4.5 Carton…" maxlength="120" /></label>
-          <label><span>Observed area / clue</span><input id="emergency-area" value="${escapeHtml(observedArea)}" placeholder="Truck, kitchen staging, hallway…" maxlength="120" /></label>
           ${crateFeaturesEnabled() ? `<label><span>Current delivery crate (manual)</span><select id="emergency-crate">${inventory.crates.map((crate) => `<option value="${escapeHtml(crate.crateId)}" ${crate.crateId === crateId ? 'selected' : ''}>${escapeHtml(crate.displayName)}</option>`).join('')}</select></label>` : ''}
-          <label><span>Destination code</span><input id="emergency-code" list="room-options" value="${escapeHtml(state.destinationCode ?? '')}" placeholder="A, KITCHEN, HOLD…" maxlength="40" /></label>
-          <label class="full-width"><span>Destination label</span><input id="emergency-label" value="${escapeHtml(state.destinationLabel ?? '')}" placeholder="Kitchen / Room A / Hold" maxlength="120" /></label>
+          ${renderDestinationCodeFields('emergency-code', 'emergency-label', emergencyDestinationCode, emergencyDestinationLabel, false, 'Destination code', 'Destination location')}
           <label class="full-width"><span>Move notes</span><textarea id="emergency-notes" rows="2" maxlength="2000" placeholder="Fragile, ask Dad, place against wall…">${escapeHtml(state.notes ?? '')}</textarea></label>
           ${editingItem ? '' : '<label class="remember-row full-width"><input id="emergency-received" type="checkbox" checked /><span>Mark this item received immediately</span></label>'}
           <button class="primary-button full-width" type="submit">${editingItem ? 'Save extra item details' : 'Add item and continue unloading'}</button>
@@ -881,8 +934,8 @@ function renderWorkMode(
             <label><span>Group by</span><select id="group-select">${groupSelectOptions()}</select></label>
             <label><span>Sort</span><select id="sort-select">${sortSelectOptions()}</select></label>
             <div class="range-filter full-width">
-              <label><span>Item number from</span><input id="filter-range-from" type="number" inputmode="numeric" min="1" max="388" value="${escapeHtml(filters.rangeFrom)}" placeholder="1" /></label>
-              <label><span>Item number through</span><input id="filter-range-to" type="number" inputmode="numeric" min="1" max="388" value="${escapeHtml(filters.rangeTo)}" placeholder="388" /></label>
+              <label><span>Item number from</span><input id="filter-range-from" type="number" inputmode="numeric" min="1" max="${maxNumericItemId(workingItems)}" value="${escapeHtml(filters.rangeFrom)}" placeholder="1" /></label>
+              <label><span>Item number through</span><input id="filter-range-to" type="number" inputmode="numeric" min="1" max="${maxNumericItemId(workingItems)}" value="${escapeHtml(filters.rangeTo)}" placeholder="${maxNumericItemId(workingItems)}" /></label>
             </div>
             <button class="secondary-button full-width" data-action="clear-filters">Clear all filters and sorting</button>
           </div>
@@ -893,6 +946,7 @@ function renderWorkMode(
     <div id="floating-lookup-host" aria-live="polite"></div>
 
     <div id="exact-match-region">${exactResult && exactEntry ? renderExactMatchCallout(exactEntry) : ''}</div>
+    <div id="group-toolbar-region">${renderGroupToolbar(groups)}</div>
 
     <section class="crate-list" id="inventory-results">
       ${groups.map((group) => renderGroup(group)).join('')}
@@ -991,6 +1045,21 @@ function groupSubtitle(): string {
   return 'Inventory results';
 }
 
+function renderGroupToolbar(groups: ItemGroup[]): string {
+  if (groupBy === 'none' || !groups.length) return '';
+  const totalItems = groups.reduce((sum, group) => sum + group.entries.length, 0);
+  const totalReceived = groups.reduce((sum, group) => sum + group.entries.filter((entry) => entry.state.received).length, 0);
+  const totalRouted = groups.reduce((sum, group) => sum + group.entries.filter((entry) => hasDestination(entry.item, entry.state)).length, 0);
+  return `
+    <section class="group-toolbar" aria-label="Grouped inventory controls">
+      <div>${icon(groupBy === 'destination' ? 'destination' : 'original-room')}<div><strong>${groups.length} room group${groups.length === 1 ? '' : 's'}</strong><span>${totalItems} items · ${totalRouted} routed · ${totalReceived} checked in</span></div></div>
+      <div class="group-toolbar-actions">
+        <button type="button" class="secondary-button compact-button" data-action="collapse-all-groups">Collapse all</button>
+        <button type="button" class="secondary-button compact-button" data-action="expand-all-groups">Expand all</button>
+      </div>
+    </section>`;
+}
+
 function renderGroup(group: ItemGroup): string {
   const received = group.entries.filter((entry) => entry.state.received).length;
   const assigned = group.entries.filter((entry) => hasDestination(entry.item, entry.state)).length;
@@ -1001,21 +1070,20 @@ function renderGroup(group: ItemGroup): string {
         <div class="crate-items">${group.entries.map((entry) => renderItem(entry)).join('')}</div>
       </section>`;
   }
-  const open = Boolean(queryText) || filter !== 'all' || countActiveFilters() > 0;
+  const open = Boolean(queryText) || expandedGroupKeys.has(group.key);
   return `
-    <details class="crate" ${open ? 'open' : ''}>
+    <details class="crate" data-group-key="${escapeHtml(group.key)}" ${open ? 'open' : ''}>
       <summary>
         <div>
           <strong>${escapeHtml(group.title)}</strong>
-          <span>${escapeHtml(group.subtitle)} · ${assigned}/${group.entries.length} routed</span>
+          <span>${escapeHtml(group.subtitle)} · ${group.entries.length} items · ${assigned} routed · ${received} checked</span>
         </div>
         <div class="crate-progress">${received}/${group.entries.length}</div>
       </summary>
       <div class="crate-items">
         ${group.entries.map((entry) => renderItem(entry)).join('')}
       </div>
-      </div>
-    </section>`;
+    </details>`;
 }
 
 function renderItem(entry: VisibleItem): string {
@@ -1140,14 +1208,7 @@ function renderPlanningActions(item: InventoryItem, state: DerivedItemState): st
         <span class="keep-original-icon">${icon('keep')}</span>
         <span><b>Keep the original room name</b><small>Use “${escapeHtml(item.originalRoom || 'original room')}” as the final destination without entering a new code or label.</small></span>
       </label>
-      <label class="destination-custom-field ${keepOriginal ? 'is-disabled' : ''}">
-        <span>Destination code</span>
-        <input id="code-${safeId(item.itemId)}" list="room-options" value="${escapeHtml(state.destinationCode ?? '')}" placeholder="A, B, KITCHEN…" ${keepOriginal ? 'disabled' : ''} />
-      </label>
-      <label class="destination-custom-field ${keepOriginal ? 'is-disabled' : ''}">
-        <span>Destination label</span>
-        <input id="label-${safeId(item.itemId)}" value="${escapeHtml(state.destinationLabel ?? '')}" placeholder="Room A / Kitchen / Garage" ${keepOriginal ? 'disabled' : ''} />
-      </label>
+      ${renderDestinationCodeFields(`code-${safeId(item.itemId)}`, `label-${safeId(item.itemId)}`, state.destinationCode, state.destinationLabel, keepOriginal)}
       <label class="full-width">
         <span>Placement or handling notes</span>
         <textarea id="notes-${safeId(item.itemId)}" rows="2" placeholder="Against left wall, fragile, ask Dad…">${escapeHtml(state.notes ?? '')}</textarea>
@@ -1165,12 +1226,8 @@ function renderBulkTools(items: InventoryItem[]): string {
   if (selectedRoom !== bulkPlannerSelectedRoom) bulkPlannerSelectedRoom = selectedRoom;
   const buttonLabel = bulkPlannerBusy ? 'Saving room assignment…' : 'Apply to every piece in this old room';
   return `
-    <section class="bulk-panel ${bulkPlannerOpen ? 'is-open' : ''}" data-bulk-panel>
-      <button type="button" class="bulk-panel-toggle" data-action="toggle-bulk-planner" aria-expanded="${bulkPlannerOpen ? 'true' : 'false'}">
-        <span class="bulk-panel-toggle-title">${icon('room')} Fast planning tools</span>
-        <span class="bulk-panel-toggle-state" aria-hidden="true">${bulkPlannerOpen ? '−' : '+'}</span>
-      </button>
-      <div class="bulk-panel-body" ${bulkPlannerOpen ? '' : 'hidden'}>
+    <details class="bulk-panel" ${bulkPlannerOpen ? 'open' : ''}>
+      <summary>${icon('room')} Fast planning tools</summary>
       <div class="bulk-grid">
         <section>
           <h3>Route an entire old room</h3>
@@ -1182,11 +1239,10 @@ function renderBulkTools(items: InventoryItem[]): string {
             <span><b>Keep original room name</b><small>Example: Kitchen stays Kitchen, Master Bedroom stays Master Bedroom.</small></span>
           </label>
           <div id="bulk-custom-destination" class="bulk-custom-destination ${bulkPlannerKeepOriginal ? 'is-disabled' : ''}">
-            <label><span>New destination code</span><input id="bulk-code" list="room-options" value="${escapeHtml(bulkPlannerCode)}" placeholder="A, B, STORAGE…" ${bulkPlannerKeepOriginal || bulkPlannerBusy ? 'disabled' : ''} /></label>
-            <label><span>New destination label</span><input id="bulk-label" value="${escapeHtml(bulkPlannerLabel)}" placeholder="Room A" ${bulkPlannerKeepOriginal || bulkPlannerBusy ? 'disabled' : ''} /></label>
+            ${renderDestinationCodeFields('bulk-code', 'bulk-label', bulkPlannerCode, bulkPlannerLabel, bulkPlannerKeepOriginal || bulkPlannerBusy, 'New destination code', 'New destination location')}
           </div>
           <button class="primary-button bulk-route-button ${bulkPlannerBusy ? 'is-busy' : ''}" data-action="bulk-route-room" ${bulkPlannerBusy ? 'disabled aria-busy="true"' : ''}>${icon(bulkPlannerBusy ? 'progress' : 'route')} ${buttonLabel}</button>
-          <p id="bulk-save-note" class="bulk-save-note" aria-live="polite">${escapeHtml(bulkPlannerStatusMessage || 'The planner stays open while room events sync, so you can continue directly to the next room.')}</p>
+          <p class="bulk-save-note" aria-live="polite">The planner stays open while room events sync, so you can continue directly to the next room.</p>
         </section>
         ${crateFeaturesEnabled() ? `<section>
           <h3>Assign a documented item range to a crate</h3>
@@ -1199,8 +1255,7 @@ function renderBulkTools(items: InventoryItem[]): string {
           <button class="primary-button" data-action="bulk-assign-crate">Assign range to crate</button>
         </section>` : ''}
       </div>
-      </div>
-    </section>`;
+    </details>`;
 }
 
 function renderReadiness(counts: CountSummary, workingItems: InventoryItem[]): string {
@@ -1302,6 +1357,34 @@ function attachGlobalHandlers(): void {
       requestAnimationFrame(() => activeSearch?.focus());
       return;
     }
+    if (action === 'clear-destination-code') {
+      const codeTarget = button.dataset.codeTarget;
+      const labelTarget = button.dataset.labelTarget;
+      const codeSelect = codeTarget ? document.getElementById(codeTarget) as HTMLSelectElement | null : null;
+      const labelInput = labelTarget ? document.getElementById(labelTarget) as HTMLInputElement | null : null;
+      if (codeSelect) codeSelect.value = '';
+      if (labelInput) labelInput.value = '';
+      (button as HTMLButtonElement).disabled = true;
+      if (codeTarget === 'bulk-code') {
+        bulkPlannerCode = '';
+        bulkPlannerLabel = '';
+      }
+      codeSelect?.focus();
+      return;
+    }
+    if (action === 'collapse-all-groups') {
+      expandedGroupKeys.clear();
+      document.querySelectorAll<HTMLDetailsElement>('.crate[data-group-key]').forEach((details) => { details.open = false; });
+      return;
+    }
+    if (action === 'expand-all-groups') {
+      document.querySelectorAll<HTMLDetailsElement>('.crate[data-group-key]').forEach((details) => {
+        const key = details.dataset.groupKey;
+        if (key) expandedGroupKeys.add(key);
+        details.open = true;
+      });
+      return;
+    }
     if (action === 'clear-filters') {
       clearFilters();
       render();
@@ -1337,16 +1420,6 @@ function attachGlobalHandlers(): void {
       render();
     }
     if (action === 'save-plan' && itemId) await savePlan(itemId);
-    if (action === 'toggle-bulk-planner') {
-      bulkPlannerOpen = !bulkPlannerOpen;
-      if (!bulkPlannerOpen && bulkPlannerDeferredRender) {
-        bulkPlannerDeferredRender = false;
-        renderPreservingElementPosition('[data-bulk-panel]');
-      } else {
-        syncBulkPlannerDisclosure();
-      }
-      return;
-    }
     if (action === 'bulk-route-room') await bulkRouteRoom();
     if (action === 'bulk-assign-crate') await bulkAssignCrate();
     if (action === 'open-emergency-modal') {
@@ -1377,6 +1450,7 @@ function attachGlobalHandlers(): void {
     }
     if (action === 'device-settings') {
       destinationDraft = getDestinationCatalog().map((room) => ({ ...room, originalCode: room.code }));
+      destinationDraftDirty = false;
       showSettings = true;
       render();
     }
@@ -1384,10 +1458,12 @@ function attachGlobalHandlers(): void {
       if (button.matches('.modal-backdrop') && target.closest('[data-modal-panel]')) return;
       showSettings = false;
       destinationDraft = undefined;
+      destinationDraftDirty = false;
       render();
     }
     if (action === 'add-destination-row') {
       destinationDraft = readDestinationDraftFromDom();
+      destinationDraftDirty = true;
       destinationDraft.push({ code: '', label: '', active: true, originalCode: '' });
       render();
       requestAnimationFrame(() => {
@@ -1398,6 +1474,7 @@ function attachGlobalHandlers(): void {
     }
     if (action === 'remove-destination-row') {
       destinationDraft = readDestinationDraftFromDom();
+      destinationDraftDirty = true;
       const index = Number(button.dataset.index);
       if (Number.isInteger(index) && index >= 0 && index < destinationDraft.length) destinationDraft.splice(index, 1);
       render();
@@ -1425,6 +1502,21 @@ function attachGlobalHandlers(): void {
     if (action === 'print-signs') printRoomSigns();
     if (action === 'print-checklist') printDayOfChecklist();
   });
+
+  appRoot.addEventListener('toggle', (event) => {
+    const details = event.target as HTMLDetailsElement;
+    if (details.matches('.crate[data-group-key]')) {
+      const key = details.dataset.groupKey;
+      if (key) {
+        if (details.open) expandedGroupKeys.add(key);
+        else expandedGroupKeys.delete(key);
+      }
+      return;
+    }
+    if (!details.matches('.bulk-panel')) return;
+    bulkPlannerOpen = details.open;
+    if (!details.open) window.setTimeout(flushDeferredRender, 0);
+  }, true);
 
   appRoot.addEventListener('submit', async (event) => {
     const form = event.target as HTMLFormElement;
@@ -1455,6 +1547,11 @@ function attachGlobalHandlers(): void {
   appRoot.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
     const sourceId = input.dataset.sourceId ?? input.id;
+
+    if (input.matches('[data-destination-field]')) {
+      destinationDraftDirty = true;
+      return;
+    }
 
     if (sourceId === 'bulk-code') {
       bulkPlannerCode = input.value.toUpperCase();
@@ -1487,7 +1584,6 @@ function attachGlobalHandlers(): void {
     }
   });
 
-
   appRoot.addEventListener('focusin', (event) => {
     const input = event.target as HTMLInputElement;
     if (!isSearchInput(input)) return;
@@ -1495,14 +1591,9 @@ function attachGlobalHandlers(): void {
     syncFloatingLookupUi();
   });
 
-  appRoot.addEventListener('focusout', (event) => {
-    const input = event.target as HTMLInputElement;
-    if (!isSearchInput(input) || !deferredFullRender) return;
-    window.setTimeout(() => {
-      if (isSearchInput(document.activeElement)) return;
-      deferredFullRender = false;
-      renderPreservingScroll();
-    }, 180);
+  appRoot.addEventListener('focusout', () => {
+    if (!deferredFullRender) return;
+    window.setTimeout(flushDeferredRender, 180);
   });
 
   appRoot.addEventListener('change', (event) => {
@@ -1510,11 +1601,17 @@ function attachGlobalHandlers(): void {
     const sourceId = input.dataset.sourceId ?? input.id;
     if (sourceId.startsWith('code-')) {
       const itemId = input.closest<HTMLElement>('[data-item-id]')?.dataset.itemId;
-      if (itemId) fillRoomLabel(input.value, `#label-${safeId(itemId)}`);
+      if (itemId) fillRoomLabel(input.value, `#label-${safeId(itemId)}`, input);
       return;
     }
     if (sourceId === 'emergency-code') {
-      fillRoomLabel(input.value, '#emergency-label');
+      fillRoomLabel(input.value, '#emergency-label', input);
+      return;
+    }
+    if (sourceId === 'bulk-code') {
+      bulkPlannerCode = normalizeDestinationCode(input.value);
+      bulkPlannerLabel = destinationLabelForCode(getDestinationCatalog(), bulkPlannerCode);
+      fillRoomLabel(bulkPlannerCode, '#bulk-label', input);
       return;
     }
     if (sourceId.startsWith('keep-original-')) {
@@ -1535,7 +1632,7 @@ function attachGlobalHandlers(): void {
     else if (sourceId === 'filter-pack') filters.packType = input.value;
     else if (sourceId === 'filter-destination') filters.destination = input.value;
     else if (sourceId === 'filter-crate') filters.crate = input.value;
-    else if (sourceId === 'group-select') groupBy = input.value as GroupBy;
+    else if (sourceId === 'group-select') { groupBy = input.value as GroupBy; expandedGroupKeys.clear(); }
     else if (sourceId === 'sort-select') sortBy = input.value as SortBy;
     else return;
     render();
@@ -1550,6 +1647,7 @@ function attachGlobalHandlers(): void {
 }
 
 function applyViewPreset(view: string): void {
+  expandedGroupKeys.clear();
   if (view === 'checked') {
     filter = 'received';
     groupBy = 'none';
@@ -1571,8 +1669,72 @@ function applyViewPreset(view: string): void {
   sortBy = 'item-asc';
 }
 
+async function ensureSharedDestinationCatalogMigrated(): Promise<void> {
+  if (sharedCatalogMigrationAttempted || sharedDestinationCatalogSnapshot || !cloudStatus.authorized) return;
+  const legacyEvent = latestDestinationCatalogEvent();
+  if (!legacyEvent) return;
+  sharedCatalogMigrationAttempted = true;
+  const catalog = deriveDestinationCatalog(events, defaultRooms);
+  try {
+    await sync.saveDestinationCatalog(catalog);
+  } catch (error) {
+    sharedCatalogMigrationAttempted = false;
+    console.warn('The legacy destination list remains available locally; shared document migration will retry.', error);
+  }
+}
+
 function getDestinationCatalog(): RoomOption[] {
-  return deriveDestinationCatalog(events, defaultRooms);
+  return sharedDestinationCatalog?.length
+    ? sharedDestinationCatalog.map((room) => ({ ...room }))
+    : deriveDestinationCatalog(events, defaultRooms);
+}
+
+function sanitizeSharedDestinationCatalog(catalog: RoomOption[]): RoomOption[] {
+  const used = new Set<string>();
+  const cleaned: RoomOption[] = [];
+  for (const room of catalog) {
+    const code = normalizeDestinationCode(room.code).slice(0, 40);
+    const label = room.label.trim().slice(0, 120);
+    if (!code || !label || used.has(code)) continue;
+    used.add(code);
+    cleaned.push({ code, label, directions: room.directions?.trim().slice(0, 240) || undefined, active: room.active !== false });
+  }
+  return cleaned.length ? cleaned : defaultRooms.map((room) => ({ ...room }));
+}
+
+function destinationSelectOptionsHtml(currentCode = '', currentLabel = ''): string {
+  const normalizedCurrent = normalizeDestinationCode(currentCode);
+  const options = destinationOptions(getDestinationCatalog(), normalizedCurrent, currentLabel);
+  return [
+    `<option value="" ${normalizedCurrent ? '' : 'selected'}>Choose destination code…</option>`,
+    ...options.map((room) => `<option value="${escapeHtml(room.code)}" data-label="${escapeHtml(room.label)}" ${room.code === normalizedCurrent ? 'selected' : ''}>${escapeHtml(room.code)} — ${escapeHtml(room.label)}</option>`)
+  ].join('');
+}
+
+function renderDestinationCodeFields(
+  codeId: string,
+  labelId: string,
+  currentCode: string | undefined,
+  currentLabel: string | undefined,
+  disabled = false,
+  codeTitle = 'Destination code',
+  labelTitle = 'Destination location'
+): string {
+  const code = normalizeDestinationCode(currentCode ?? '');
+  const catalogLabel = destinationLabelForCode(getDestinationCatalog(), code);
+  const label = catalogLabel || currentLabel?.trim() || '';
+  return `
+    <div class="destination-custom-field destination-code-field ${disabled ? 'is-disabled' : ''}">
+      <span>${escapeHtml(codeTitle)}</span>
+      <div class="destination-code-control">
+        <select id="${escapeHtml(codeId)}" data-destination-code aria-label="${escapeHtml(codeTitle)}" ${disabled ? 'disabled' : ''}>${destinationSelectOptionsHtml(code, label)}</select>
+        <button type="button" class="destination-clear-button" data-action="clear-destination-code" data-code-target="${escapeHtml(codeId)}" data-label-target="${escapeHtml(labelId)}" aria-label="Clear destination code" ${disabled || !code ? 'disabled' : ''}>×</button>
+      </div>
+    </div>
+    <label class="destination-custom-field destination-label-readonly ${disabled ? 'is-disabled' : ''}">
+      <span>${escapeHtml(labelTitle)}</span>
+      <input id="${escapeHtml(labelId)}" value="${escapeHtml(label)}" readonly aria-readonly="true" tabindex="-1" placeholder="Select a destination code" />
+    </label>`;
 }
 
 function latestDestinationCatalogEvent(): MoveEvent | undefined {
@@ -1661,64 +1823,47 @@ async function saveDestinationCatalog(): Promise<void> {
   }
 
   await putEvents(newEvents);
-  events = await getAllEvents();
+  replaceEvents(await getAllEvents());
+  sharedDestinationCatalog = cleanCatalog.map((room) => ({ ...room }));
+  sharedDestinationCatalogSnapshot = {
+    catalog: cleanCatalog.map((room) => ({ ...room })),
+    updatedAt: now,
+    updatedByUid: cloudStatus.user?.uid ?? '',
+    updatedByUsername: cloudStatus.user?.username ?? ''
+  };
   destinationDraft = cleanCatalog.map((room) => ({ ...room, originalCode: room.code }));
+  destinationDraftDirty = false;
   render();
-  await sync.flushLocalEvents();
+  void sync.saveDestinationCatalog(cleanCatalog).catch((error) => {
+    console.warn('The shared destination document is queued locally and will retry after reconnecting.', error);
+  });
+  void sync.flushLocalEvents().catch((error) => {
+    console.warn('The destination audit event remains saved locally and will retry after reconnecting.', error);
+  });
   showToast(`Shared destination list saved${migratedCount ? ` · ${migratedCount} routed piece${migratedCount === 1 ? '' : 's'} updated` : ''}`);
 }
 
 function toggleItemDestinationInputs(itemId: string, keepOriginal: boolean): void {
-  const code = document.querySelector<HTMLInputElement>(`#code-${safeId(itemId)}`);
+  const code = document.querySelector<HTMLSelectElement>(`#code-${safeId(itemId)}`);
   const label = document.querySelector<HTMLInputElement>(`#label-${safeId(itemId)}`);
-  for (const input of [code, label]) {
-    if (!input) continue;
-    input.disabled = keepOriginal;
-    input.closest('label')?.classList.toggle('is-disabled', keepOriginal);
+  if (code) {
+    code.disabled = keepOriginal;
+    code.closest('.destination-custom-field')?.classList.toggle('is-disabled', keepOriginal);
+    code.closest('.destination-code-control')?.querySelector<HTMLButtonElement>('.destination-clear-button')?.toggleAttribute('disabled', keepOriginal || !code.value);
+  }
+  if (label) {
+    label.closest('label')?.classList.toggle('is-disabled', keepOriginal);
   }
 }
 
 function toggleBulkDestinationInputs(keepOriginal: boolean): void {
   const container = document.querySelector<HTMLElement>('#bulk-custom-destination');
   container?.classList.toggle('is-disabled', keepOriginal);
-  container?.querySelectorAll<HTMLInputElement>('input').forEach((input) => {
-    input.disabled = keepOriginal;
+  container?.querySelectorAll<HTMLSelectElement>('select').forEach((select) => { select.disabled = keepOriginal; });
+  container?.querySelectorAll<HTMLButtonElement>('.destination-clear-button').forEach((button) => {
+    const select = button.closest('.destination-code-control')?.querySelector<HTMLSelectElement>('select');
+    button.disabled = keepOriginal || !select?.value;
   });
-}
-
-function syncBulkPlannerDisclosure(): void {
-  const panel = document.querySelector<HTMLElement>('[data-bulk-panel]');
-  const body = panel?.querySelector<HTMLElement>('.bulk-panel-body');
-  const toggle = panel?.querySelector<HTMLButtonElement>('[data-action="toggle-bulk-planner"]');
-  const state = panel?.querySelector<HTMLElement>('.bulk-panel-toggle-state');
-  panel?.classList.toggle('is-open', bulkPlannerOpen);
-  if (body) body.hidden = !bulkPlannerOpen;
-  toggle?.setAttribute('aria-expanded', String(bulkPlannerOpen));
-  if (state) state.textContent = bulkPlannerOpen ? '−' : '+';
-}
-
-function syncBulkPlannerControls(): void {
-  syncBulkPlannerDisclosure();
-  const panel = document.querySelector<HTMLElement>('[data-bulk-panel]');
-  const room = panel?.querySelector<HTMLSelectElement>('#bulk-room');
-  const keep = panel?.querySelector<HTMLInputElement>('#bulk-keep-original');
-  const code = panel?.querySelector<HTMLInputElement>('#bulk-code');
-  const label = panel?.querySelector<HTMLInputElement>('#bulk-label');
-  const button = panel?.querySelector<HTMLButtonElement>('[data-action="bulk-route-room"]');
-  const note = panel?.querySelector<HTMLElement>('#bulk-save-note');
-
-  if (room) room.disabled = bulkPlannerBusy;
-  if (keep) keep.disabled = bulkPlannerBusy;
-  if (code) code.disabled = bulkPlannerBusy || bulkPlannerKeepOriginal;
-  if (label) label.disabled = bulkPlannerBusy || bulkPlannerKeepOriginal;
-  if (button) {
-    button.disabled = bulkPlannerBusy;
-    button.classList.toggle('is-busy', bulkPlannerBusy);
-    button.setAttribute('aria-busy', String(bulkPlannerBusy));
-    button.innerHTML = `${icon(bulkPlannerBusy ? 'progress' : 'route')} ${bulkPlannerBusy ? 'Saving room assignment…' : 'Apply to every piece in this old room'}`;
-  }
-  if (note) note.textContent = bulkPlannerStatusMessage || 'The planner stays open while room events sync, so you can continue directly to the next room.';
-  toggleBulkDestinationInputs(bulkPlannerKeepOriginal);
 }
 
 async function saveSharedMoveSettings(): Promise<void> {
@@ -1735,7 +1880,7 @@ function renderPreservingFocus(id: string): void {
   const sourceId = current?.dataset.sourceId;
   const value = current?.value ?? '';
   const selection = current?.selectionStart ?? value.length;
-  forceRender();
+  render();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       const replacement =
@@ -1747,11 +1892,15 @@ function renderPreservingFocus(id: string): void {
   });
 }
 
-function fillRoomLabel(code: string, selector: string): void {
-  const room = getDestinationCatalog().find((candidate) => candidate.code.toLowerCase() === code.trim().toLowerCase());
-  if (!room) return;
+function fillRoomLabel(code: string, selector: string, codeControl?: HTMLInputElement | HTMLSelectElement): void {
+  const normalized = normalizeDestinationCode(code);
   const labelInput = document.querySelector<HTMLInputElement>(selector);
-  if (labelInput && !labelInput.value.trim()) labelInput.value = room.label;
+  const selectedLabel = codeControl instanceof HTMLSelectElement
+    ? codeControl.selectedOptions.item(0)?.dataset.label ?? ''
+    : '';
+  if (labelInput) labelInput.value = destinationLabelForCode(getDestinationCatalog(), normalized) || selectedLabel;
+  const clearButton = codeControl?.closest<HTMLElement>('.destination-code-control')?.querySelector<HTMLButtonElement>('.destination-clear-button');
+  if (clearButton) clearButton.disabled = !normalized;
 }
 
 async function createEvent(type: MoveEvent['type'], itemId: string, payload: Record<string, unknown>): Promise<boolean> {
@@ -1761,7 +1910,7 @@ async function createEvent(type: MoveEvent['type'], itemId: string, payload: Rec
   }
   const moveEvent = makeEvent(type, itemId, payload);
   await putEvent(moveEvent);
-  events = await getAllEvents();
+  replaceEvents(await getAllEvents());
   render();
   await sync.publish(moveEvent);
   return true;
@@ -1788,9 +1937,8 @@ async function savePlan(itemId: string): Promise<void> {
   const state = deriveItemState(itemId, events);
   const assignedCrateId = document.querySelector<HTMLSelectElement>(`#crate-${safeId(itemId)}`)?.value || state.assignedCrateId || 'UNASSIGNED';
   const keepOriginalRoom = document.querySelector<HTMLInputElement>(`#keep-original-${safeId(itemId)}`)?.checked ?? false;
-  const code = keepOriginalRoom ? '' : (document.querySelector<HTMLInputElement>(`#code-${safeId(itemId)}`)?.value.trim().toUpperCase() ?? '');
-  const room = getDestinationCatalog().find((candidate) => candidate.code.toUpperCase() === code);
-  const label = keepOriginalRoom ? '' : (document.querySelector<HTMLInputElement>(`#label-${safeId(itemId)}`)?.value.trim() || room?.label || '');
+  const code = keepOriginalRoom ? '' : normalizeDestinationCode(document.querySelector<HTMLSelectElement>(`#code-${safeId(itemId)}`)?.value ?? '');
+  const label = keepOriginalRoom ? '' : (destinationLabelForCode(getDestinationCatalog(), code) || document.querySelector<HTMLInputElement>(`#label-${safeId(itemId)}`)?.value.trim() || '');
   const notes = document.querySelector<HTMLTextAreaElement>(`#notes-${safeId(itemId)}`)?.value.trim() ?? '';
   if (keepOriginalRoom && !item.originalRoom?.trim()) {
     window.alert('This piece has no original room label to keep. Enter a new destination instead.');
@@ -1818,9 +1966,8 @@ async function saveEmergencyItem(editingId?: string): Promise<void> {
   const packType = document.querySelector<HTMLInputElement>('#emergency-pack')?.value.trim() || 'Unspecified package';
   const observedArea = document.querySelector<HTMLInputElement>('#emergency-area')?.value.trim() || 'Move-day addition';
   const assignedCrateId = document.querySelector<HTMLSelectElement>('#emergency-crate')?.value || editingState.assignedCrateId || editingItem?.crateId || 'UNASSIGNED';
-  const destinationCode = document.querySelector<HTMLInputElement>('#emergency-code')?.value.trim().toUpperCase() ?? '';
-  const room = getDestinationCatalog().find((candidate) => candidate.code.toUpperCase() === destinationCode);
-  const destinationLabel = document.querySelector<HTMLInputElement>('#emergency-label')?.value.trim() || room?.label || '';
+  const destinationCode = normalizeDestinationCode(document.querySelector<HTMLSelectElement>('#emergency-code')?.value ?? '');
+  const destinationLabel = destinationLabelForCode(getDestinationCatalog(), destinationCode) || document.querySelector<HTMLInputElement>('#emergency-label')?.value.trim() || '';
   const notes = document.querySelector<HTMLTextAreaElement>('#emergency-notes')?.value.trim() ?? '';
   const markReceived = document.querySelector<HTMLInputElement>('#emergency-received')?.checked ?? false;
 
@@ -1829,7 +1976,16 @@ async function saveEmergencyItem(editingId?: string): Promise<void> {
     return;
   }
 
-  const itemId = editingId || `EXTRA-${crypto.randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase()}`;
+  const requestedItemId = document.querySelector<HTMLInputElement>('#emergency-item-number')?.value.trim() ?? '';
+  if (!editingId && !isValidSequentialExtraItemId(requestedItemId)) {
+    window.alert('Use a sequential inventory number of 389 or higher.');
+    return;
+  }
+  const itemId = editingId || requestedItemId;
+  if (!editingId && getWorkingItems().some((item) => item.itemId === itemId)) {
+    window.alert(`Item ${itemId} already exists. Use the next available number.`);
+    return;
+  }
   const detailEvent = makeEvent(editingId ? 'ITEM_EDIT' : 'ITEM_ADD', itemId, {
     description,
     comments,
@@ -1853,7 +2009,7 @@ async function saveEmergencyItem(editingId?: string): Promise<void> {
   }
 
   await putEvents(newEvents);
-  events = await getAllEvents();
+  replaceEvents(await getAllEvents());
   showEmergencyModal = false;
   editingEmergencyItemId = undefined;
   queryText = `id:${itemId}`;
@@ -1879,17 +2035,15 @@ async function bulkRouteRoom(): Promise<void> {
   if (bulkPlannerBusy) return;
   const originalRoom = document.querySelector<HTMLSelectElement>('#bulk-room')?.value ?? bulkPlannerSelectedRoom;
   const keepOriginalRoom = document.querySelector<HTMLInputElement>('#bulk-keep-original')?.checked ?? bulkPlannerKeepOriginal;
-  const rawCode = document.querySelector<HTMLInputElement>('#bulk-code')?.value ?? bulkPlannerCode;
-  const rawLabel = document.querySelector<HTMLInputElement>('#bulk-label')?.value ?? bulkPlannerLabel;
-  const code = keepOriginalRoom ? '' : rawCode.trim().toUpperCase();
-  const roomOption = getDestinationCatalog().find((candidate) => candidate.code.toUpperCase() === code);
-  const label = keepOriginalRoom ? '' : (rawLabel.trim() || roomOption?.label || '');
+  const rawCode = document.querySelector<HTMLSelectElement>('#bulk-code')?.value ?? bulkPlannerCode;
+  const code = keepOriginalRoom ? '' : normalizeDestinationCode(rawCode);
+  const label = keepOriginalRoom ? '' : (destinationLabelForCode(getDestinationCatalog(), code) || document.querySelector<HTMLInputElement>('#bulk-label')?.value.trim() || '');
 
   bulkPlannerOpen = true;
   bulkPlannerSelectedRoom = originalRoom;
   bulkPlannerKeepOriginal = keepOriginalRoom;
   bulkPlannerCode = rawCode;
-  bulkPlannerLabel = rawLabel;
+  bulkPlannerLabel = label;
 
   if (!originalRoom) {
     window.alert('Choose an original room.');
@@ -1904,8 +2058,7 @@ async function bulkRouteRoom(): Promise<void> {
   if (!window.confirm(`${destinationDescription} for all ${targets.length} pieces originally listed in ${originalRoom}?`)) return;
 
   bulkPlannerBusy = true;
-  bulkPlannerStatusMessage = `Saving ${targets.length} piece${targets.length === 1 ? '' : 's'} from ${originalRoom}…`;
-  syncBulkPlannerControls();
+  renderPreservingElementPosition('.bulk-panel');
 
   const newEvents = targets.map((item, index) => {
     const state = deriveItemState(item.itemId, events);
@@ -1955,31 +2108,28 @@ async function saveBulkEvents(newEvents: MoveEvent[], confirmation: string): Pro
   bulkSyncInProgress = true;
   bulkSyncRenderQueued = false;
   bulkPlannerOpen = true;
-  let syncQueuedOffline = false;
   try {
     await putEvents(newEvents);
-    events = await getAllEvents();
-    bulkPlannerDeferredRender = true;
-    bulkPlannerStatusMessage = confirmation;
-    syncBulkPlannerControls();
-    showToast(confirmation);
-    try {
-      await sync.flushLocalEvents();
-    } catch (error) {
-      syncQueuedOffline = true;
-      console.warn('Bulk room events remain saved locally and will sync after reconnecting.', error);
-    }
+    replaceEvents(await getAllEvents());
+    toastMessage = confirmation;
   } finally {
     bulkSyncInProgress = false;
     bulkPlannerBusy = false;
-    if (bulkSyncRenderQueued) events = await getAllEvents();
+    if (bulkSyncRenderQueued) replaceEvents(await getAllEvents());
     bulkSyncRenderQueued = false;
-    if (syncQueuedOffline) {
-      bulkPlannerStatusMessage = `${confirmation} Saved locally; cloud sync will retry automatically.`;
-      showToast(bulkPlannerStatusMessage);
-    }
-    syncBulkPlannerControls();
+    renderPreservingElementPosition('.bulk-panel');
   }
+
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(clearToastWithoutRender, 3200);
+
+  // Cloud upload runs in the background. The room planner is usable again as soon
+  // as the local durable save succeeds, while Firebase safely catches up.
+  void sync.flushLocalEvents().catch((error) => {
+    console.warn('Bulk room events remain saved locally and will sync after reconnecting.', error);
+    toastMessage = `${confirmation} Saved locally; cloud sync will retry automatically.`;
+    renderOrDeferDuringInteraction();
+  });
 }
 
 async function saveDeviceNameFromSettings(): Promise<void> {
@@ -2021,7 +2171,7 @@ async function forgetDevice(): Promise<void> {
   inventory = emptyInventoryBundle();
   physicalCrates = [];
   inventoryCached = false;
-  events = [];
+  replaceEvents([]);
   meta = { deviceId: crypto.randomUUID(), deviceName: suggestedDeviceName() };
   await putMeta(meta);
   showSettings = false;
@@ -2069,7 +2219,7 @@ async function importBackup(file: File): Promise<void> {
     if (baseCount && baseCount !== inventory.items.length) throw new Error('This backup uses a different master inventory item count.');
     if (!Array.isArray(parsed.events)) throw new Error('Backup does not contain an event list.');
     await putEvents(parsed.events);
-    events = await getAllEvents();
+    replaceEvents(await getAllEvents());
     render();
     await sync.flushLocalEvents();
     window.alert(`Imported ${parsed.events.length} event records.`);
@@ -2182,6 +2332,13 @@ function sortEntries(entries: VisibleItem[]): VisibleItem[] {
     if (sortBy === 'relevance') return compareItemIds(a.item, b.item);
     return compareItemIds(a.item, b.item);
   });
+}
+
+function maxNumericItemId(items: InventoryItem[]): number {
+  const ids = items
+    .map((item) => (/^\d+$/.test(item.itemId) ? Number(item.itemId) : 0))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  return Math.max(388, ...ids);
 }
 
 function compareItemIds(a: InventoryItem, b: InventoryItem): number {
@@ -2326,23 +2483,14 @@ function sortSelectOptions(): string {
 
 function showToast(message: string): void {
   toastMessage = message;
-  syncToastDom();
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => {
-    toastMessage = '';
-    syncToastDom();
-  }, 2600);
+  toastTimer = window.setTimeout(clearToastWithoutRender, 2600);
+  renderOrDeferDuringInteraction();
 }
 
-function syncToastDom(): void {
-  const existing = document.querySelector<HTMLElement>('.success-toast');
-  if (!toastMessage) {
-    existing?.remove();
-    return;
-  }
-  const markup = `<div class="success-toast" role="status" aria-live="polite">${icon('check')}<span>${escapeHtml(toastMessage)}</span></div>`;
-  if (existing) existing.outerHTML = markup;
-  else appRoot.insertAdjacentHTML('beforeend', markup);
+function clearToastWithoutRender(): void {
+  toastMessage = '';
+  document.querySelector<HTMLElement>('.success-toast')?.remove();
 }
 
 function readinessCheck(label: string, ready: boolean, detail: string): string {
@@ -2440,6 +2588,7 @@ function formatDateTime(timestamp: number): string {
 
 function displayItemId(item?: InventoryItem): string {
   if (!item) return 'Item';
+  if (item.isAdHoc && /^\d+$/.test(item.itemId)) return `ITEM ${Number(item.itemId)} · EXTRA`;
   if (item.isAdHoc) return `EXTRA · ${item.itemId.slice(-6)}`;
   return `ITEM ${Number(item.itemId)}`;
 }

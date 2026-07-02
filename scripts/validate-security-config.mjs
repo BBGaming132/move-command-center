@@ -33,7 +33,8 @@ if (!rules.includes("'ITEM_ADD'") || !rules.includes("'ITEM_EDIT'") || !rules.in
 if (!rules.includes("'SETTINGS_UPDATE'") || !rules.includes("'MOVE-SETTINGS'") || !rules.includes('hasCrateListing')) throw new Error('Firestore rules do not protect the shared crate-listing setting.');
 if (!rules.includes("'DESTINATIONS_UPDATE'") || !rules.includes("'MOVE-DESTINATIONS'") || !rules.includes('catalogJson')) throw new Error('Firestore rules do not protect the shared destination catalog.');
 if (!rules.includes('keepOriginalRoom')) throw new Error('Firestore rules do not allow the keep-original-room routing flag.');
-if (!rules.includes("^EXTRA-[A-Z0-9]{8,24}$")) throw new Error('Firestore rules do not restrict emergency-item identifiers.');
+if (!rules.includes("^EXTRA-[A-Z0-9]{8,24}$") || !rules.includes('38[9]') || !rules.includes('isSequentialExtraItemId')) throw new Error('Firestore rules do not restrict legacy and sequential emergency-item identifiers.');
+if (!rules.includes('/shared/destinations') || !rules.includes('validSharedDestinationDocument') || !rules.includes('updatedByUid == request.auth.uid')) throw new Error('Firestore rules do not protect the authoritative shared destination document.');
 
 console.log('Security configuration validation passed: move IDs, username domain, private-data exclusions, and actor rules are aligned.');
 

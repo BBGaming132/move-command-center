@@ -72,6 +72,14 @@ export interface RoomOption {
   active: boolean;
 }
 
+
+export interface SharedDestinationCatalogSnapshot {
+  catalog: RoomOption[];
+  updatedAt: number;
+  updatedByUid: string;
+  updatedByUsername: string;
+}
+
 export interface MoveEvent {
   id: string;
   moveId: string;
